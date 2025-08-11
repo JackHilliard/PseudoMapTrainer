@@ -13,26 +13,19 @@ import sys
 import mmcv
 import numpy as np
 import os
-from collections import OrderedDict
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.geometry_utils import view_points
-from os import path as osp
-# from pyquaternion import Quaternion
-from shapely.geometry import MultiPoint, box
-from typing import Dict, List, Optional, Tuple, Union
 
-from mmdet3d.core.bbox.box_np_ops import points_cam2img
-from mmdet3d.datasets import NuScenesDataset
+import pickle
+from PIL import Image
+
+from os import path as osp
+from shapely.geometry import box
+from typing import Tuple
+
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
-from nuscenes.map_expansion.bitmap import BitMap
-from matplotlib.patches import Polygon as mPolygon
 
 from shapely import affinity, ops
-# from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
-from shapely.geometry import Polygon, MultiPolygon, LineString, Point, box, MultiLineString
-from matplotlib.axes import Axes
-from matplotlib.figure import Figure
+from shapely.geometry import MultiPolygon, LineString, box, MultiLineString
 import networkx as nx
 sys.path.append('.')
 
@@ -183,6 +176,24 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
     can_bus.extend([0., 0.])
     return np.array(can_bus)
 
+def normalize_2d_pts(pts, pc_range):
+    patch_h = pc_range[4]-pc_range[1]
+    patch_w = pc_range[3]-pc_range[0]
+    new_pts = pts.copy()
+    new_pts[...,0:1] = pts[..., 0:1] - pc_range[0]
+    new_pts[...,1:2] = pts[...,1:2] - pc_range[1]
+    factor = np.array([patch_w, patch_h])
+    normalized_pts = new_pts / factor
+    return normalized_pts
+
+def denormalize_2d_pts(pts, pc_range):
+    new_pts = pts.copy()
+    new_pts[...,0:1] = (pts[..., 0:1]*(pc_range[3] -
+                            pc_range[0]) + pc_range[0])
+    new_pts[...,1:2] = (pts[...,1:2]*(pc_range[4] -
+                            pc_range[1]) + pc_range[1])
+    return new_pts
+
 
 def obtain_sensor2top(nusc,
                       sensor_token,
@@ -259,6 +270,7 @@ def load_geo_split_scenes(splits=["train", "val", "test"]):
 
 def _fill_trainval_infos(nusc,
                          nusc_can_bus,
+                         pseudo_path,
                          nusc_maps, 
                          map_explorer,
                          train_scenes,
@@ -318,6 +330,12 @@ def _fill_trainval_infos(nusc,
             'timestamp': sample['timestamp'],
         }
 
+        if pseudo_path is not None:
+            pseudo_dirpath = lidar_path.replace(nusc.dataroot, pseudo_path).replace(".pcd.bin","")
+            info['pseudo_vec_path'] = osp.join(pseudo_dirpath, 'map_vectors.pkl')
+            info['pseudo_rast_path'] = osp.join(pseudo_dirpath, 'bev_label.png')
+            info['pseudo_mask_path'] = osp.join(pseudo_dirpath, 'bev_mask_post.png')
+
         if sample['next'] == '':
             frame_idx = 0
         else:
@@ -359,19 +377,36 @@ def _fill_trainval_infos(nusc,
             else:
                 break
         info['sweeps'] = sweeps
-        # obtain annotation
-        # import ipdb;ipdb.set_trace()
-        info = obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range)
+
+        if pseudo_path is not None:
+            info["annotation"] = load_pseudo_vectormap(info, point_cloud_range)
+        else:
+            info["annotation"] = obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range)
 
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
-        else:
+        elif sample['scene_token'] in val_scenes:
             val_nusc_infos.append(info)
 
     return train_nusc_infos, val_nusc_infos
 
+
+def load_pseudo_vectormap(info, pc_range):
+    with open(info["pseudo_vec_path"], 'rb') as f:
+        pseudo_vec = pickle.load(f)
+
+    # load BEV raster from bev_label.png as an numpy array
+    pseudo_rast = Image.open(info["pseudo_rast_path"])
+    raster_range = [0]*3 + list(pseudo_rast.size) + [0]
+
+    transf_coords = lambda pts: denormalize_2d_pts(normalize_2d_pts(pts, raster_range), pc_range)
+    for key, pts_list in pseudo_vec.items():
+        pseudo_vec[key] = [transf_coords(pts) for pts in pts_list]
+
+    return pseudo_vec
+
+
 def obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range):
-    # import ipdb;ipdb.set_trace()
     lidar2ego = np.eye(4)
     lidar2ego[:3,:3] = Quaternion(info['lidar2ego_rotation']).rotation_matrix
     lidar2ego[:3, 3] = info['lidar2ego_translation']
@@ -385,17 +420,13 @@ def obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range):
     lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
 
     location = info['map_location']
-    ego2global_translation = info['ego2global_translation']
-    ego2global_rotation = info['ego2global_rotation']
 
     patch_h = point_cloud_range[4]-point_cloud_range[1]
     patch_w = point_cloud_range[3]-point_cloud_range[0]
     patch_size = (patch_h, patch_w)
     vector_map = VectorizedLocalMap(nusc_maps[location], map_explorer[location],patch_size)
     map_anns = vector_map.gen_vectorized_samples(lidar2global_translation, lidar2global_rotation)
-    # import ipdb;ipdb.set_trace()
-    info["annotation"] = map_anns
-    return info
+    return map_anns
 
 
 class VectorizedLocalMap(object):
@@ -778,18 +809,23 @@ class VectorizedLocalMap(object):
 
 
 def create_nuscenes_infos(root_path,
+                          pseudo_path,
                           out_path,
                           can_bus_root_path,
                           info_prefix,
                           version='v1.0-trainval',
                           max_sweeps=10,
-                          use_geo_split=False):
+                          use_geo_split=False,
+                          only_val_split=False):
     """Create info file of nuscene dataset.
 
     Given the raw data, generate its related info file in pkl format.
 
     Args:
         root_path (str): Path of the data root.
+        pseudo_path (str): Path to pseudo labels directory.
+        out_path (str): Path to output directory.
+        can_bus_root_path (str): Path to the can bus data root.
         info_prefix (str): Prefix of the info file to be generated.
         version (str): Version of the data.
             Default: 'v1.0-trainval'
@@ -797,6 +833,8 @@ def create_nuscenes_infos(root_path,
             Default: 10
         use_geo_split (bool): Whether to use geo split in
             custom_tools/maptrv2/geosplits/near.
+            Default: False
+        only_val_split (bool): Whether to only use validation split.
             Default: False
     """
     from nuscenes.nuscenes import NuScenes
@@ -837,6 +875,10 @@ def create_nuscenes_infos(root_path,
     else:
         raise ValueError('unknown')
 
+    if only_val_split:
+        print('Only using val scenes')
+        train_scenes = []
+
     # filter existing scenes.
     available_scenes = sum([get_available_scenes(nusc) for nusc in nuscs], [])
     available_scene_names = [s['name'] for s in available_scenes]
@@ -863,24 +905,25 @@ def create_nuscenes_infos(root_path,
     val_nusc_infos = []
     for nusc in nuscs:
         train_nusc_info, val_nusc_info = _fill_trainval_infos(
-            nusc, nusc_can_bus, nusc_maps, map_explorer, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
+            nusc, nusc_can_bus, pseudo_path, nusc_maps, map_explorer, train_scenes,
+            val_scenes, test=test, max_sweeps=max_sweeps)
         train_nusc_infos += train_nusc_info
         val_nusc_infos += val_nusc_info
 
     metadata = dict(version=version)
+    data = dict(infos=train_nusc_infos, metadata=metadata)
     if test:
         print('test sample: {}'.format(len(train_nusc_infos)))
-        data = dict(infos=train_nusc_infos, metadata=metadata)
         info_path = osp.join(out_path,
                              '{}_map_infos_temporal_test.pkl'.format(info_prefix))
         mmcv.dump(data, info_path)
     else:
         print('train sample: {}, val sample: {}'.format(
             len(train_nusc_infos), len(val_nusc_infos)))
-        data = dict(infos=train_nusc_infos, metadata=metadata)
-        info_path = osp.join(out_path,
-                             '{}_map_infos_temporal_train.pkl'.format(info_prefix))
-        mmcv.dump(data, info_path)
+        if not only_val_split:
+            info_path = osp.join(out_path,
+                                '{}_map_infos_temporal_train.pkl'.format(info_prefix))
+            mmcv.dump(data, info_path)
         data['infos'] = val_nusc_infos
         info_val_path = osp.join(out_path,
                                  '{}_map_infos_temporal_val.pkl'.format(info_prefix))
@@ -889,13 +932,15 @@ def create_nuscenes_infos(root_path,
 
 
 def nuscenes_data_prep(root_path,
+                       pseudo_path,
                        can_bus_root_path,
                        info_prefix,
                        version,
                        dataset_name,
                        out_dir,
                        max_sweeps=10,
-                       use_geo_split=False):
+                       use_geo_split=False,
+                       only_val_split=False):
     """Prepare data related to nuScenes dataset.
 
     Related data consists of '.pkl' files recording basic infos,
@@ -903,6 +948,7 @@ def nuscenes_data_prep(root_path,
 
     Args:
         root_path (str): Path of dataset root.
+        pseudo_path (str): Path to pseudo labels directory.
         info_prefix (str): The prefix of info filenames.
         version (str): Dataset version.
         dataset_name (str): The dataset class name.
@@ -910,8 +956,8 @@ def nuscenes_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
     create_nuscenes_infos(
-        root_path, out_dir, can_bus_root_path, info_prefix,
-        version=version, max_sweeps=max_sweeps, use_geo_split=use_geo_split)
+        root_path, pseudo_path, out_dir, can_bus_root_path, info_prefix,
+        version=version, max_sweeps=max_sweeps, use_geo_split=use_geo_split, only_val_split=only_val_split)
 
     # if version == 'v1.0-test':
     #     info_test_path = osp.join(
@@ -943,6 +989,16 @@ parser.add_argument(
     action='store_true',
     help="Whether to use only geo scenes"
 )
+parser.add_argument(
+    "--only-val-split",
+    action='store_true',
+    help="Whether to only convert data from the validation split"
+)
+parser.add_argument(
+    "--pseudo-labels-dir",
+    type=str,
+    default=None,
+    help="The directory of pseudo labels. Default is None")
 parser.add_argument(
     '--canbus',
     type=str,
@@ -976,20 +1032,25 @@ if __name__ == '__main__':
     train_version = f'{args.version}-trainval'
     nuscenes_data_prep(
         root_path=args.root_path,
+        pseudo_path=args.pseudo_labels_dir,
         can_bus_root_path=args.canbus,
         info_prefix=args.extra_tag,
         version=train_version,
         dataset_name='NuScenesDataset',
         out_dir=args.out_dir,
         max_sweeps=args.max_sweeps,
-        use_geo_split=args.use_geo_split)
-    test_version = f'{args.version}-test'
-    nuscenes_data_prep(
-        root_path=args.root_path,
-        can_bus_root_path=args.canbus,
-        info_prefix=args.extra_tag,
-        version=test_version,
-        dataset_name='NuScenesDataset',
-        out_dir=args.out_dir,
-        max_sweeps=args.max_sweeps,
-        use_geo_split=args.use_geo_split)
+        use_geo_split=args.use_geo_split,
+        only_val_split=args.only_val_split)
+
+    if not args.only_val_split:
+        test_version = f'{args.version}-test'
+        nuscenes_data_prep(
+            root_path=args.root_path,
+            pseudo_path=args.pseudo_labels_dir,
+            can_bus_root_path=args.canbus,
+            info_prefix=args.extra_tag,
+            version=test_version,
+            dataset_name='NuScenesDataset',
+            out_dir=args.out_dir,
+            max_sweeps=args.max_sweeps,
+            use_geo_split=args.use_geo_split)

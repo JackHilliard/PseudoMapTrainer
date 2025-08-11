@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapTRv2 (e03f097)
+#   (https://github.com/hustvl/MapTR/tree/e03f097abef19e1ba3fed5f471a8d80fbfa0a064)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 # ---------------------------------------------
 # Copyright (c) OpenMMLab. All rights reserved.
 # ---------------------------------------------
@@ -17,6 +26,7 @@ import torch
 import torch.distributed as dist
 from mmcv.image import tensor2imgs
 from mmcv.runner import get_dist_info
+from copy import deepcopy
 
 from mmdet.core import encode_mask_results
 
@@ -25,7 +35,11 @@ import mmcv
 import numpy as np
 import pycocotools.mask as mask_util
 
-from tools.lane_evaluator import LaneEvaluator, line_classes, polygon_classes
+
+from projects.mmdet3d_plugin.maptr.assigners.maptr_assigner \
+    import mask_and_resample_polylines, _resample_1d, normalize_2d_pts, denormalize_2d_pts
+
+from custom_tools.lane_evaluator import LaneEvaluator, line_classes, polygon_classes
 
 
 WIDTH = 240
@@ -130,6 +144,49 @@ def post_process_instance_polygon(data, preds):
     return gts, dts
 
 
+def vec_list2inter_tensor(vec_li, fixed_ptsnum_per_pred_line):
+    if len(vec_li) > 0:
+        pts = torch.cat(
+            [_resample_1d(torch.tensor(vector["pts"]), fixed_ptsnum_per_pred_line).unsqueeze(0)
+            for vector in vec_li
+            ])
+    else:
+        pts = torch.zeros((0, fixed_ptsnum_per_pred_line, 2))
+    return pts
+
+
+def mask_gt(gt_data_item, bev_mask, bev_range, fixed_ptsnum_per_pred_line, resample=False):
+    gt_data_item = deepcopy(gt_data_item)
+    gt_tens_pts = vec_list2inter_tensor(gt_data_item["vectors"], fixed_ptsnum_per_pred_line)
+    split_pred_pts, idx_map, _, _, all_valid_idx = mask_and_resample_polylines(normalize_2d_pts(gt_tens_pts, bev_range),
+                                                                torch.tensor(bev_mask).to(bool), min_pts=4, allow_split=True,
+                                                                resample=resample)
+    
+    compl_vectors = [gt_data_item["vectors"][i] for i in all_valid_idx]
+    if resample:
+        # resample the complete vectors
+        resamp_compl_vectors = vec_list2inter_tensor(compl_vectors, fixed_ptsnum_per_pred_line)
+        for i, res_vec in enumerate(resamp_compl_vectors):
+            compl_vectors[i]["pts"] = res_vec.numpy().tolist()
+    
+    # handle the split vectors
+    split_vectors = []
+    for i, idx in enumerate(idx_map):
+        vec = deepcopy(gt_data_item["vectors"][idx])
+        pts = denormalize_2d_pts(split_pred_pts[i][None], bev_range)[0].numpy().tolist()
+        if vec["cls_name"] in polygon_classes.keys():
+            pts += [pts[0]]
+            if resample:
+                # resample the split vectors
+                pts = _resample_1d(torch.tensor(pts), fixed_ptsnum_per_pred_line).numpy().tolist()
+        vec["pts"] = pts
+        vec["pts_num"] = len(vec["pts"])
+        split_vectors.append(vec)
+    gt_data_item["vectors"] = compl_vectors + split_vectors
+
+    return gt_data_item
+
+
 def post_process_instance_line(data, preds):
     def instance_to_segm_line(params):
         normalized_params = np.copy(params)
@@ -165,7 +222,7 @@ def post_process_instance_line(data, preds):
     return gts, dts
 
 
-def custom_single_gpu_test(model, data_loader):
+def custom_single_gpu_test(model, data_loader, masked_eval=False):
     model.eval()
     bbox_results = []
     mask_results = []
@@ -174,6 +231,9 @@ def custom_single_gpu_test(model, data_loader):
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
     have_mask = False
+
+    if not osp.exists(dataset.map_ann_file):
+        dataset._format_gt() # Fixes the bug in the original MapVR implementation
 
     with open(dataset.map_ann_file, "r") as f:
         gt_data = json.load(f)["GTs"]
@@ -203,13 +263,19 @@ def custom_single_gpu_test(model, data_loader):
                                       width=WIDTH,
                                       height=HEIGHT)
 
-    for i, data in enumerate(data_loader):
+    for data in data_loader:
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
 
             token = data["img_metas"][0].data[0][0]["sample_idx"]
-            coco_results_line.append(evaluator_line.evaluate(gt_data_dict[token], result[0]))
-            coco_results_polygon.append(evaluator_polygon.evaluate(gt_data_dict[token], result[0]))
+            gt_sample = gt_data_dict[token]
+            
+            if masked_eval:
+                gt_sample = mask_gt(gt_data_dict[token], result[0]["bev_mask"], model.dataset.pc_range, model.fixed_ptsnum_per_pred_line)
+            elif "bev_mask" in result[0].keys():
+                del result[0]["bev_mask"]
+            coco_results_line.append(evaluator_line.evaluate(gt_sample, result[0]))
+            coco_results_polygon.append(evaluator_polygon.evaluate(gt_sample, result[0]))
 
             # encode mask results
             if isinstance(result, dict):
@@ -237,7 +303,7 @@ def custom_single_gpu_test(model, data_loader):
     return {'bbox_results': bbox_results, 'mask_results': mask_results}, [{"type": "line", "evaluator": evaluator_line, "results": coco_results_line}, {"type": "polygon", "evaluator": evaluator_polygon, "results": coco_results_polygon}]
 
 
-def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, masked_eval=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
@@ -264,6 +330,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         prog_bar = mmcv.ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     have_mask = False
+
+    if not osp.exists(dataset.map_ann_file):
+        dataset._format_gt() # Fixes the bug in the original MapVR implementation
 
     with open(dataset.map_ann_file, "r") as f:
         gt_data = json.load(f)["GTs"]
@@ -298,8 +367,14 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
             result = model(return_loss=False, rescale=True, **data)
 
             token = data["img_metas"][0].data[0][0]["sample_idx"]
-            coco_results_line.append(evaluator_line.evaluate(gt_data_dict[token], result[0]))
-            coco_results_polygon.append(evaluator_polygon.evaluate(gt_data_dict[token], result[0]))
+            gt_sample = gt_data_dict[token]
+            
+            if masked_eval:
+                gt_sample = mask_gt(gt_data_dict[token], result[0]["bev_mask"], model.dataset.pc_range, model.fixed_ptsnum_per_pred_line)
+            elif "bev_mask" in result[0].keys():
+                del result[0]["bev_mask"]
+            coco_results_line.append(evaluator_line.evaluate(gt_sample, result[0]))
+            coco_results_polygon.append(evaluator_polygon.evaluate(gt_sample, result[0]))
 
             # encode mask results
             if isinstance(result, dict):

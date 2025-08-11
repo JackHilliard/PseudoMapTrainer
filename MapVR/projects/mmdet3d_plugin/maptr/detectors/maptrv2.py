@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapTRv2 (e03f097)
+#   (https://github.com/hustvl/MapTR/tree/e03f097abef19e1ba3fed5f471a8d80fbfa0a064)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 import copy
 import torch
 import torch.nn as nn
@@ -126,7 +135,9 @@ class MapTRv2(MVXTwoStageDetector):
                           prev_bev=None,
                           gt_depth=None,
                           gt_seg_mask=None,
-                          gt_pv_seg_mask=None,):
+                          gt_pv_seg_mask=None,
+                          bev_mask=None,
+                          bev_label=None):
         """Forward function'
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -154,29 +165,33 @@ class MapTRv2(MVXTwoStageDetector):
                 loss_depth = torch.nan_to_num(loss_depth)
             losses.update(loss_depth=loss_depth)
 
-        loss_inputs = [gt_bboxes_3d, gt_labels_3d, gt_seg_mask, gt_pv_seg_mask, outs]
+        duplicate_of_gt_idx = [torch.arange(len(gt_labels), device=gt_labels.device) for gt_labels in [gt_labels for gt_labels in gt_labels_3d]]
+        loss_inputs = [gt_bboxes_3d, gt_labels_3d, gt_seg_mask, gt_pv_seg_mask, bev_mask, bev_label, duplicate_of_gt_idx, outs]
         losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
         losses.update(losses_pts)
         # import ipdb;ipdb.set_trace()
         k_one2many = self.pts_bbox_head.k_one2many
-        multi_gt_bboxes_3d = copy.deepcopy(gt_bboxes_3d)
-        multi_gt_labels_3d = copy.deepcopy(gt_labels_3d)
-        for i, (each_gt_bboxes_3d, each_gt_labels_3d) in enumerate(zip(multi_gt_bboxes_3d, multi_gt_labels_3d)):
-            each_gt_bboxes_3d.instance_list = each_gt_bboxes_3d.instance_list * k_one2many
-            each_gt_bboxes_3d.instance_labels = each_gt_bboxes_3d.instance_labels * k_one2many
-            multi_gt_labels_3d[i] = each_gt_labels_3d.repeat(k_one2many)
-        # import ipdb;ipdb.set_trace()
-        one2many_outs = outs['one2many_outs']
-        loss_one2many_inputs = [multi_gt_bboxes_3d, multi_gt_labels_3d, gt_seg_mask, gt_pv_seg_mask, one2many_outs]
-        loss_dict_one2many = self.pts_bbox_head.loss(*loss_one2many_inputs, img_metas=img_metas)
+        if k_one2many > 0:
+            multi_gt_bboxes_3d = copy.deepcopy(gt_bboxes_3d)
+            multi_gt_labels_3d = copy.deepcopy(gt_labels_3d)
+            multi_dup_gt_idx = copy.deepcopy(duplicate_of_gt_idx)
+            for batch_idx, (each_gt_bboxes_3d, each_gt_labels_3d, each_dup_gt_idx) in enumerate(zip(multi_gt_bboxes_3d, multi_gt_labels_3d, multi_dup_gt_idx)):
+                each_gt_bboxes_3d.instance_list = each_gt_bboxes_3d.instance_list * k_one2many
+                each_gt_bboxes_3d.instance_labels = each_gt_bboxes_3d.instance_labels * k_one2many
+                multi_gt_labels_3d[batch_idx] = each_gt_labels_3d.repeat(k_one2many)
+                multi_dup_gt_idx[batch_idx] = each_dup_gt_idx.repeat(k_one2many)
+            # import ipdb;ipdb.set_trace()
+            one2many_outs = outs['one2many_outs']
+            loss_one2many_inputs = [multi_gt_bboxes_3d, multi_gt_labels_3d, gt_seg_mask, gt_pv_seg_mask, bev_mask, bev_label, multi_dup_gt_idx, one2many_outs]
+            loss_dict_one2many = self.pts_bbox_head.loss(*loss_one2many_inputs, img_metas=img_metas)
 
-        lambda_one2many = self.pts_bbox_head.lambda_one2many
-        for key, value in loss_dict_one2many.items():
-            if key + "_one2many" in losses.keys():
-                losses[key + "_one2many"] += value * lambda_one2many
-            else:
-                losses[key + "_one2many"] = value * lambda_one2many
-        # import ipdb;ipdb.set_trace()
+            lambda_one2many = self.pts_bbox_head.lambda_one2many
+            for key, value in loss_dict_one2many.items():
+                if key + "_one2many" in losses.keys():
+                    losses[key + "_one2many"] += value * lambda_one2many
+                else:
+                    losses[key + "_one2many"] = value * lambda_one2many
+            # import ipdb;ipdb.set_trace()
         return losses
 
     def forward_dummy(self, img):
@@ -272,6 +287,8 @@ class MapTRv2(MVXTwoStageDetector):
                       gt_depth=None,
                       gt_seg_mask=None,
                       gt_pv_seg_mask=None,
+                      bev_mask=None,
+                      bev_label=None
                       ):
         """Forward training function.
         Args:
@@ -314,7 +331,9 @@ class MapTRv2(MVXTwoStageDetector):
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore, prev_bev, gt_depth,gt_seg_mask,gt_pv_seg_mask)
+                                            gt_bboxes_ignore, prev_bev, gt_depth,
+                                            gt_seg_mask,gt_pv_seg_mask,
+                                            bev_mask, bev_label)
 
         losses.update(losses_pts)
         return losses

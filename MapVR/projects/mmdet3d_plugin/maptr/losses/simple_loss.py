@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapTRv2 (e03f097)
+#   (https://github.com/hustvl/MapTR/tree/e03f097abef19e1ba3fed5f471a8d80fbfa0a064)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 import torch
 import torch.nn as nn
 from mmdet.models.builder import LOSSES
@@ -69,6 +78,24 @@ class SimpleLoss_v1(nn.Module):
         ytgt = ytgt[fg_mask]
         loss = F.binary_cross_entropy_with_logits(ypred, ytgt.float(), reduction='none',).sum() / max(1.0, fg_mask.sum())
         return loss*self.loss_weight
+
+@LOSSES.register_module()
+class MaskedBCE(torch.nn.Module):
+    def __init__(self, pos_weight, loss_weight):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.loss_weight = loss_weight
+
+    def forward(self, ypred, ytgt, mask):
+        loss = F.binary_cross_entropy_with_logits(
+            ypred,
+            ytgt,
+            pos_weight=torch.tensor(self.pos_weight, device=ypred.device),
+            reduction="none"
+        ) * mask
+
+        return loss.sum() / (mask.sum() + 1e-8) * self.loss_weight
+
 
 @LOSSES.register_module()
 class SimpleLoss(torch.nn.Module):

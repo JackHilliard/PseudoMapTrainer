@@ -48,6 +48,9 @@ fixed_ptsnum_per_pred_line = 20
 eval_use_same_gt_sample_num_flag=True
 num_map_classes = len(map_classes)
 
+renderer_H = 256
+renderer_W = 128
+
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
@@ -102,8 +105,8 @@ model = dict(
         bev_w=bev_w_,
         num_query=900,
         num_vec_one2one=50,
-        num_vec_one2many=300,
-        k_one2many=6,
+        num_vec_one2many=0,
+        k_one2many=0,
         num_pts_per_vec=fixed_ptsnum_per_pred_line, # one bbox
         num_pts_per_gt_vec=fixed_ptsnum_per_gt_line,
         dir_interval=1,
@@ -115,6 +118,8 @@ model = dict(
         sync_cls_avg_factor=True,
         with_box_refine=True,
         as_two_stage=False,
+        weight_mask=False,
+        constant_pts_avg_factor=False,
         code_size=2,
         code_weights=[1.0, 1.0, 1.0, 1.0],
         aux_seg=aux_seg_cfg,
@@ -189,14 +194,19 @@ model = dict(
         loss_bbox=dict(type='L1Loss', loss_weight=0.0),
         loss_iou=dict(type='GIoULoss', loss_weight=0.0),
         loss_pts=dict(type='PtsL1Loss', loss_weight=1.0),
-        loss_rendered_mask=dict(type='RenderedMaskDiceLoss', weight=15.0),
+        loss_rendered_mask=dict(
+            type='RenderedMaskDiceLoss',
+            weight=15.0,
+            renderer_H=renderer_H,
+            renderer_W=renderer_W,
+            sample_weighting_with_mask=False),
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.002),
-        loss_seg=dict(type='SimpleLoss', 
+        loss_seg=dict(type='MaskedBCE', 
             pos_weight=4.0,
             loss_weight=1.0),
         loss_pv_seg=dict(type='SimpleLoss', 
                     pos_weight=1.0,
-                    loss_weight=2.0),),
+                    loss_weight=10.0),),
     # model training and testing settings
     train_cfg=dict(pts=dict(
         grid_size=[512, 512, 1],
@@ -204,7 +214,8 @@ model = dict(
         point_cloud_range=point_cloud_range,
         out_size_factor=4,
         assigner=dict(
-            type='MapTRAssigner',
+            type='MaskedMapTRAssigner',
+            allow_split=True,
             cls_cost=dict(type='FocalLossCost', weight=2.0),
             reg_cost=dict(type='BBoxL1Cost', weight=0.0, box_format='xywh'),
             # reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
@@ -216,6 +227,7 @@ model = dict(
 
 dataset_type = 'CustomNuScenesOfflineLocalMapDataset'
 data_root = 'data/nuscenes/'
+data_root_seg = "data/m2f_infer/"
 file_client_args = dict(backend='disk')
 
 
@@ -261,9 +273,12 @@ data = dict(
     samples_per_gpu=4,
     workers_per_gpu=4, # TODO
     train=dict(
-        type=dataset_type,
+        type='PseudoMapDataset',
+        raster=[renderer_W, renderer_H],
+        mask_thresh=0.5,
+        data_root_seg=data_root_seg,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes_map_infos_temporal_train.pkl',
+        ann_file=data_root + 'nuscenes_pseudo_multi_map_infos_temporal_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -312,7 +327,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=6e-4,
+    lr=3e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -328,8 +343,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
 total_epochs = 24
-evaluation = dict(interval=2, pipeline=test_pipeline, metric='chamfer',
-                  save_best='NuscMap_chamfer/mAP', rule='greater')
+evaluation = dict(interval=6, pipeline=test_pipeline, metric='chamfer')
 # total_epochs = 50
 # evaluation = dict(interval=1, pipeline=test_pipeline)
 
@@ -342,5 +356,5 @@ log_config = dict(
         dict(type='TensorboardLoggerHook')
     ])
 fp16 = dict(loss_scale=512.)
-checkpoint_config = dict(max_keep_ckpts=1, interval=2)
+checkpoint_config = dict(interval=6)
 find_unused_parameters=True

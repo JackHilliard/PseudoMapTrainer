@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapVR (eec23fe)
+#   (https://github.com/ZhangGongjie/MapVR/tree/eec23fe86215b82f7630c0e983777bcfe6677939)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 import functools
 import torch
 import torch.nn as nn
@@ -725,7 +734,7 @@ class MyChamferDistance(nn.Module):
 
 
 # for matching only!
-def batch_dice_cost(inputs, targets, already_sigmoided=False):
+def batch_dice_cost(inputs, targets, already_sigmoided=False, eps=1e-4):
     """
     Compute the DICE loss, similar to generalized IOU for masks
     Args:
@@ -739,8 +748,8 @@ def batch_dice_cost(inputs, targets, already_sigmoided=False):
         inputs = inputs.sigmoid()
     inputs = inputs.flatten(1)
     numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
-    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
-    loss = 1 - (numerator + 1) / (denominator + 1)
+    denominator = inputs.pow(2).sum(-1)[:, None] + targets.pow(2).sum(-1)[None, :]
+    loss = 1 - numerator / (denominator + eps)
     return loss
 
 
@@ -782,7 +791,7 @@ def batch_sigmoid_focal_cost(inputs, targets, alpha: float = 0.25, gamma: float 
 
 
 # for instance segmentation loss computation only!
-def mask_dice_loss(inputs, targets, num_masks, already_sigmoided=False):
+def mask_dice_loss(inputs, targets, pixel_weight=None, sample_weight=None, num_masks=None, reduction="mean", already_sigmoided=False, eps=1e-4):
     """
     Compute the DICE loss, similar to generalized IOU for masks
     Args:
@@ -791,15 +800,31 @@ def mask_dice_loss(inputs, targets, num_masks, already_sigmoided=False):
         targets: A float tensor with the same shape as inputs. Stores the binary
                  classification label for each element in inputs
                 (0 for the negative class and 1 for the positive class).
+        pixel_weight: Pixel-wise weight. Same shape as inputs and targets.
+        sample_weight: Sample-wise weight. Same shape as targets.shape[0].
     """
     if not already_sigmoided:
         inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
 
-    return loss.sum() / num_masks
+    if pixel_weight is None:
+        pixel_weight = 1 # else tensor of shape as inputs
+    
+    if sample_weight is None:
+        sample_weight = 1
+
+    inputs = inputs.flatten(1)
+    numerator = 2 * (pixel_weight * inputs * targets).sum(-1)
+    denominator = (pixel_weight * (inputs.pow(2) + targets.pow(2))).sum(-1)
+    loss = 1 - numerator/ (denominator + eps)
+
+    loss = loss * sample_weight
+
+    if reduction == "mean":
+        return loss.sum() / num_masks
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        raise NotImplementedError
 
     # # NOTE: we don't reduce dimension here, because we still need to perform 
     # #       element-wise minimum on the loss.
@@ -851,12 +876,8 @@ class RenderedMaskDiceCost(object):
 
     @torch.no_grad()
     def __call__(self, pred_cls, pred_pts, gt_labels, gt_pts):
-        num_preds = pred_cls.shape[0]
         num_gts = gt_labels.shape[0]
-        num_pts_per_pred = pred_pts.shape[1]
-        num_pts_per_gt = gt_pts.shape[1]
 
-        assert pred_cls.shape[0] == pred_pts.shape[0]
         assert gt_labels.shape[0] == gt_pts.shape[0]
         assert pred_pts.shape[-1] == 2
         assert gt_pts.shape[-1] == 2
@@ -895,18 +916,27 @@ class RenderedMaskDiceCost(object):
 
 @LOSSES.register_module()
 class RenderedMaskDiceLoss(object):
-    def __init__(self, weight=10.):
+    def __init__(self, weight=10., renderer_H=256, renderer_W=128, sample_weighting_with_mask=True):
         self.weight = weight
 
         # TODO: to make rasterization's hyperparameters configurable and not hardcoded
         self.renderer_lane = SoftLane(2.0, 'boundary')
         self.renderer_polygon = SoftPolygon(4.0, 'mask')
-        self.renderer_H = 256
-        self.renderer_W = 128
+        self.renderer_H = renderer_H
+        self.renderer_W = renderer_W
         self.polygon_class_labels = [1]
         self.lane_class_labels = [0, 2]
+        self.sample_weighting_with_mask = sample_weighting_with_mask
 
-    def __call__(self, pred_cls, pred_pts, gt_labels, gt_pts):
+    def __call__(self, pred_cls, pred_pts, gt_labels, gt_pts, valid_mask, bev_mask=None, reduction="mean", weight_norm=None):
+        
+        pred_cls = pred_cls[valid_mask]
+        pred_pts = pred_pts[valid_mask]
+        gt_labels = gt_labels[valid_mask]
+        gt_pts = gt_pts[valid_mask]
+        if bev_mask is not None:
+            bev_mask = bev_mask[valid_mask].reshape(-1, self.renderer_H*self.renderer_W)
+
         num_preds = pred_cls.shape[0]
         num_gts = gt_labels.shape[0]
         num_pts_per_pred = pred_pts.shape[1]
@@ -931,35 +961,87 @@ class RenderedMaskDiceLoss(object):
             gt_rendered_as_polygons = self.renderer_polygon(gt_pts, self.renderer_W, self.renderer_H)
 
             # based on gt_labels, select rasterized ground truth points
-            gt_selection_indexes = [1 if gt_labels[i] in self.polygon_class_labels else 0 for i in range(num_gts)]
-            rendered_gt = torch.zeros((num_gts, self.renderer_H, self.renderer_W), device=gt_pts.device)
-            for i in range(num_gts):
-                rendered_gt[i] = gt_rendered_as_polygons[i] if (gt_selection_indexes[i] == 1) else gt_rendered_as_lanes[i]
+            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, device=gt_labels.device))
+            rendered_gt = torch.where(is_polygon[:,None,None], gt_rendered_as_polygons, gt_rendered_as_lanes)
 
         # select rendering predictions to produce loss based on matching results
-        pred_rendered_masks = torch.zeros_like(pred_rendered_as_lanes)
-        for i in range(num_preds):
-            pred_rendered_masks[i, ...] = pred_rendered_as_polygons[i, ...] if (gt_labels[i] in self.polygon_class_labels) else pred_rendered_as_lanes[i, ...]
+        pred_rendered_masks = torch.where(is_polygon[:,None,None], pred_rendered_as_polygons, pred_rendered_as_lanes)
+        if self.sample_weighting_with_mask and bev_mask is not None:
+            if weight_norm is None:
+                weight_norm = bev_mask.to(float).mean()
+            sample_weight = bev_mask.to(float).mean(-1)/weight_norm
+        else:
+            sample_weight = None
 
-        
         # # calculate the loss
-        # loss1 = mask_dice_loss(pred_rendered_as_lanes.reshape(-1, self.renderer_H*self.renderer_W), 
-        #                        rendered_gt.reshape(-1, self.renderer_H*self.renderer_W),
-        #                        num_masks=num_gts,
-        #                        already_sigmoided=True)
-        
-        # loss2 = mask_dice_loss(pred_rendered_as_polygons.reshape(-1, self.renderer_H*self.renderer_W),
-        #                        rendered_gt.reshape(-1, self.renderer_H*self.renderer_W),
-        #                        num_masks=num_gts,
-        #                        already_sigmoided=True)
-        
-        # # compute the element-wise minimum of the two losses
-        # loss = torch.minimum(loss1, loss2)
-        # loss = loss.sum()
-
         loss = mask_dice_loss(pred_rendered_masks.reshape(-1, self.renderer_H*self.renderer_W), 
                               rendered_gt.reshape(-1, self.renderer_H*self.renderer_W),
-                              num_masks=num_gts,
+                              reduction=reduction,
+                              pixel_weight=bev_mask,
+                              sample_weight=sample_weight,
+                              num_masks=len(pred_rendered_masks),
+                              already_sigmoided=True)
+        
+        return loss * self.weight
+
+
+@LOSSES.register_module()
+class O2MRenderedMaskDiceLoss(RenderedMaskDiceLoss):
+    def __call__(self, pred_pts, gt_labels, gt_pts, bev_mask, o2m_gt_matched_by, reduction="mean", weight_norm=None):
+        bev_mask = bev_mask.reshape(-1, self.renderer_H*self.renderer_W)
+
+        num_preds = pred_pts.shape[0]
+        num_gts = gt_labels.shape[0]
+
+        assert gt_labels.shape[0] == gt_pts.shape[0]
+        assert pred_pts.shape[-1] == 2
+        assert gt_pts.shape[-1] == 2
+
+        # unnormalize the coordinates
+        pred_pts = pred_pts * torch.tensor([self.renderer_W, self.renderer_H], device=pred_pts.device).reshape(1,1,2)
+        gt_pts = gt_pts * torch.tensor([self.renderer_W, self.renderer_H], device=gt_pts.device).reshape(1,1,2)
+
+        # rasterize the predicted points
+        pred_rendered_as_lanes = self.renderer_lane(pred_pts, self.renderer_W, self.renderer_H)
+        pred_rendered_as_polygons = self.renderer_polygon(pred_pts, self.renderer_W, self.renderer_H)
+
+        with torch.no_grad():
+            # rasterize the ground truth points
+            gt_rendered_as_lanes = self.renderer_lane(gt_pts, self.renderer_W, self.renderer_H)
+            gt_rendered_as_polygons = self.renderer_polygon(gt_pts, self.renderer_W, self.renderer_H)
+
+            # based on gt_labels, select rasterized ground truth points
+            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, device=gt_labels.device))
+            rendered_gt = torch.where(is_polygon[:,None,None], gt_rendered_as_polygons, gt_rendered_as_lanes)
+
+        pred_rendered_masks = torch.where(is_polygon[:,None,None], pred_rendered_as_polygons, pred_rendered_as_lanes)
+
+        # merge the rendering gts based on the one-to-many matching results
+        unique_ids, inverse_idx = torch.unique(o2m_gt_matched_by, return_inverse=True)
+        gt_rendered_sum = torch.zeros(len(unique_ids), self.renderer_H, self.renderer_W, device=gt_pts.device)
+        scatter_indices = inverse_idx[:, None, None].expand(-1, self.renderer_H, self.renderer_W)
+        gt_rendered_sum.scatter_add_(0, scatter_indices, rendered_gt)
+        gt_rendered_sum = gt_rendered_sum.clamp_max(1)
+
+        # select the rendering predictions based on the one-to-many matching results
+        first_occurrence_indices = (o2m_gt_matched_by[:,None] == unique_ids).to(float).argmax(0)
+        bev_mask = bev_mask[first_occurrence_indices]
+        pred_rendered_masks = pred_rendered_masks[first_occurrence_indices]
+
+        if self.sample_weighting_with_mask and bev_mask is not None:
+            if weight_norm is None:
+                weight_norm = bev_mask.to(float).mean()
+            sample_weight = bev_mask.to(float).mean(-1)/weight_norm
+        else:
+            sample_weight = None
+        
+        # # calculate the loss
+        loss = mask_dice_loss(pred_rendered_masks.reshape(-1, self.renderer_H*self.renderer_W), 
+                              gt_rendered_sum.reshape(-1, self.renderer_H*self.renderer_W),
+                              reduction=reduction,
+                              pixel_weight=bev_mask,
+                              sample_weight=sample_weight,
+                              num_masks=len(gt_rendered_sum),
                               already_sigmoided=True)
         
         return loss * self.weight

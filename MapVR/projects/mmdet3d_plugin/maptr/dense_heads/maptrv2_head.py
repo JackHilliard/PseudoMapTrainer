@@ -106,6 +106,7 @@ class MapTRv2Head(DETRHead):
                     pred_z_flag=False,
                     gt_z_flag=False,
                  ),
+                 ignore_pts_loss=False,
                  loss_pts=dict(type='ChamferDistance', loss_src_weight=1.0, loss_dst_weight=1.0),
                  loss_seg=dict(type='SimpleLoss', 
                               pos_weight=2.13,
@@ -115,7 +116,11 @@ class MapTRv2Head(DETRHead):
                               loss_weight=1.0),
                  loss_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),
                  loss_rendered_mask=dict(type='RenderedMaskDiceLoss', weight=10.0),
+                 o2m_loss_rendered_mask=True,
                  filter_invalid_pred=True,
+                 ssl_loss_dir=True,
+                 weight_mask=True,
+                 constant_pts_avg_factor=True,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -159,6 +164,10 @@ class MapTRv2Head(DETRHead):
         self.z_cfg = z_cfg
 
         self.filter_invalid_pred = filter_invalid_pred
+        self.ssl_loss_dir = ssl_loss_dir
+        self.ignore_pts_loss = ignore_pts_loss
+        self.weight_mask = weight_mask
+        self.constant_pts_avg_factor = constant_pts_avg_factor
         
         super(MapTRv2Head, self).__init__(
             *args, transformer=transformer, **kwargs)
@@ -167,6 +176,10 @@ class MapTRv2Head(DETRHead):
         self.loss_pts = build_loss(loss_pts)
         self.loss_dir = build_loss(loss_dir)
         self.loss_rendered_mask = build_loss(loss_rendered_mask)
+        if o2m_loss_rendered_mask:
+            o2m_loss_rendered_mask_dict = copy.deepcopy(loss_rendered_mask)
+            o2m_loss_rendered_mask_dict['type'] = "O2MRenderedMaskDiceLoss"
+            self.o2m_loss_rendered_mask = build_loss(o2m_loss_rendered_mask_dict)
 
 
         num_query = num_vec * num_pts_per_vec
@@ -479,6 +492,8 @@ class MapTRv2Head(DETRHead):
                            gt_bboxes,
                            gt_pts,
                            gt_shifts_pts,
+                           gt_bev_mask,
+                           duplicate_of_gt_idx,
                            gt_bboxes_ignore=None):
         """"Compute regression and classification targets for one image.
         Outputs from a single decoder layer of a single feature level are used.
@@ -509,7 +524,8 @@ class MapTRv2Head(DETRHead):
         
         assign_result, order_index = self.assigner.assign(
             bbox_pred, cls_score, pts_pred,
-            gt_bboxes, gt_labels, gt_pts, gt_shifts_pts, gt_bboxes_ignore
+            gt_bboxes, gt_labels, gt_pts, gt_shifts_pts,
+            gt_bev_mask, duplicate_of_gt_idx, gt_bboxes_ignore
         )
 
         sampling_result = self.sampler.sample(assign_result, bbox_pred, gt_bboxes)
@@ -517,12 +533,18 @@ class MapTRv2Head(DETRHead):
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
+        masked_applied = assign_result.get_extra_property("masked_applied")
+        pred_masked = gt_bboxes.new_zeros(num_bboxes, dtype=bool)
+        if masked_applied is not None:
+            pred_masked[pos_inds] = masked_applied[pos_inds, sampling_result.pos_assigned_gt_inds]
+
         # label targets
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.num_classes,
                                     dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
-        label_weights = gt_bboxes.new_ones(num_bboxes)
+        label_weights = gt_bboxes.new_zeros(num_bboxes)
+        label_weights[torch.cat([pos_inds, neg_inds])] = 1
 
         # bbox targets
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
@@ -533,7 +555,7 @@ class MapTRv2Head(DETRHead):
         if order_index is None:
             assigned_shift = gt_labels[sampling_result.pos_assigned_gt_inds]
         else:
-            assigned_shift = order_index[sampling_result.pos_inds, sampling_result.pos_assigned_gt_inds]
+            assigned_shift = order_index[pos_inds, sampling_result.pos_assigned_gt_inds]
         pts_targets = pts_pred.new_zeros((pts_pred.size(0), pts_pred.size(1), pts_pred.size(2)))
         pts_weights = torch.zeros_like(pts_targets)
         pts_weights[pos_inds] = 1.0
@@ -544,10 +566,32 @@ class MapTRv2Head(DETRHead):
         unshifted_pts_targets = pts_pred.new_zeros((pts_pred.size(0), pts_pred.size(1), pts_pred.size(2)))
         unshifted_pts_targets[pos_inds] = gt_pts[sampling_result.pos_assigned_gt_inds, :, :]
 
+        # one-to-many assignment
+        # o2m_assign_matrix passes the sampler by.
+        # A improved future version could implement a sampler, which can handle one-to-many assingments
+        o2m_gt_matched_by = torch.full_like(gt_labels, -1, dtype=torch.long)
+        o2m_assign_matrix = assign_result.get_extra_property("o2m_assign_matrix")
+        if o2m_assign_matrix is not None:
+            # labels for cls loss
+            o2m_pred_assinged = o2m_assign_matrix.any(-1)
+            o2m_matched_pred_idx = o2m_pred_assinged.nonzero()[:,0]
+            o2m_matched_gt_idx_first = o2m_assign_matrix.to(int).argmin(-1)[o2m_pred_assinged]
+
+            labels[o2m_matched_pred_idx] = gt_labels[o2m_matched_gt_idx_first]
+            label_weights[o2m_matched_pred_idx] = 1
+            pos_inds = torch.cat([pos_inds, o2m_matched_pred_idx], dim=0)
+            if masked_applied is not None:
+                pred_masked[o2m_matched_pred_idx] = True
+
+            o2m_matched_row, o2m_matched_col = o2m_assign_matrix.nonzero().T
+            o2m_gt_matched_by[o2m_matched_col] = o2m_matched_row
+
+
+
         # NOTE: pts_targets is the best permutation of gt_shifts_pts based on the matching process (solely from OrderedPtsL1Cost).
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pts_targets, pts_weights, unshifted_pts_targets,
-                pos_inds, neg_inds)
+                pos_inds, neg_inds, pred_masked, o2m_gt_matched_by)
 
     def get_targets(self,
                     cls_scores_list,
@@ -557,6 +601,8 @@ class MapTRv2Head(DETRHead):
                     gt_labels_list,
                     gt_pts_list,
                     gt_shifts_pts_list,
+                    gt_bev_mask_list,
+                    duplicate_of_gt_idx_list,
                     gt_bboxes_ignore_list=None):
         """"Compute regression and classification targets for a batch image.
         Outputs from a single decoder layer of a single feature level are used.
@@ -596,16 +642,17 @@ class MapTRv2Head(DETRHead):
 
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pts_targets_list, pts_weights_list, unshifted_pts_targets_list,
-         pos_inds_list, neg_inds_list) = multi_apply(
+         pos_inds_list, neg_inds_list, pred_masked_list, o2m_gt_matched_by_list) = multi_apply(
             self._get_target_single, cls_scores_list, bbox_preds_list, pts_preds_list,
-            gt_labels_list, gt_bboxes_list, gt_pts_list, gt_shifts_pts_list, gt_bboxes_ignore_list)
+            gt_labels_list, gt_bboxes_list, gt_pts_list, gt_shifts_pts_list, gt_bev_mask_list,
+            duplicate_of_gt_idx_list, gt_bboxes_ignore_list)
         
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
 
         return (labels_list, label_weights_list, bbox_targets_list,
                 bbox_weights_list, pts_targets_list, pts_weights_list, unshifted_pts_targets_list,
-                num_total_pos, num_total_neg)
+                num_total_pos, num_total_neg, pred_masked_list, o2m_gt_matched_by_list)
 
     def loss_single(self,
                     cls_scores,
@@ -615,7 +662,10 @@ class MapTRv2Head(DETRHead):
                     gt_labels_list,
                     gt_pts_list,
                     gt_shifts_pts_list,
-                    gt_bboxes_ignore_list=None):
+                    gt_bboxes_ignore_list=None,
+                    gt_bev_mask=None,
+                    gt_bev_label=None,
+                    duplicate_of_gt_idx=None):
         """"Loss function for outputs from a single decoder layer of a single
         feature level.
         Args:
@@ -643,14 +693,19 @@ class MapTRv2Head(DETRHead):
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         pts_preds_list = [pts_preds[i] for i in range(num_imgs)]
+        if gt_bev_mask is not None:
+            gt_bev_mask_list = [gt_bev_mask[i] for i in range(num_imgs)]
+        else:
+            gt_bev_mask_list = [None for _ in range(num_imgs)]
 
-        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list, pts_preds_list,
-                                           gt_bboxes_list, gt_labels_list, gt_pts_list, gt_shifts_pts_list,
-                                           gt_bboxes_ignore_list)
+        with torch.no_grad():
+            cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list, pts_preds_list,
+                                            gt_bboxes_list, gt_labels_list, gt_pts_list,
+                                            gt_shifts_pts_list, gt_bev_mask_list, duplicate_of_gt_idx, gt_bboxes_ignore_list)
         
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          pts_targets_list, pts_weights_list, unshifted_pts_targets_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
+         num_total_pos, num_total_neg, pred_masked_list, o2m_gt_matched_by_list) = cls_reg_targets
 
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
@@ -659,7 +714,10 @@ class MapTRv2Head(DETRHead):
         pts_targets = torch.cat(pts_targets_list, 0)
         unshifted_pts_targets = torch.cat(unshifted_pts_targets_list, 0)
         pts_weights = torch.cat(pts_weights_list, 0)
-
+        pred_masked = torch.cat(pred_masked_list, 0)
+        o2m_gt_matched_by = torch.cat(o2m_gt_matched_by_list, 0)
+        gt_pts = torch.cat(gt_pts_list, 0)
+        gt_labels = torch.cat(gt_labels_list, 0)
 
         # classification loss
         cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
@@ -697,12 +755,17 @@ class MapTRv2Head(DETRHead):
             pts_preds = F.interpolate(pts_preds, size=(self.num_pts_per_gt_vec), mode='linear', align_corners=True)
             pts_preds = pts_preds.permute(0,2,1).contiguous()
 
+        # partially masked pts are not considered in the loss for simplicity
+        pts_filter = isnotnan & (~pred_masked)
+
         loss_pts = self.loss_pts(
-            pts_preds[isnotnan,:,:], 
-            normalized_pts_targets[isnotnan, :,:], 
-            pts_weights[isnotnan,:,:],
-            avg_factor=num_total_pos
+            pts_preds[pts_filter], 
+            normalized_pts_targets[pts_filter], 
+            pts_weights[pts_filter],
+            avg_factor=num_total_pos if self.constant_pts_avg_factor else pts_weights[pts_filter].all(-1).all(-1).sum()
         )
+        if self.ignore_pts_loss:
+            loss_pts *= 0
 
         # loss for rasterization (by MapVR)
         pts_for_render_gt = normalize_2d_pts(unshifted_pts_targets, self.pc_range)
@@ -717,34 +780,68 @@ class MapTRv2Head(DETRHead):
             valid_mask = valid_mask & pts_weights.all(-1).all(-1)
             dir_weights = pts_weights[:, :-self.dir_interval, 0]
         else:
-            dir_weights = torch.ones_like(pts_weights[:,:-self.dir_interval,0]) # all valid since no GT matching
-        
+            dir_weights = torch.ones_like(pts_weights[:,:-self.dir_interval,0])
+
+        if gt_bev_mask is not None:
+            gt_bev_mask = gt_bev_mask.repeat_interleave(num_query, 0)
+            gt_bev_mask = torch.where(pred_masked[:,None,None], gt_bev_mask, torch.ones_like(gt_bev_mask))
+            gt_bev_mask = gt_bev_mask.unflatten(0, (bs, num_query))
+
+        o2m_gt_matched = o2m_gt_matched_by != -1
+        o2m_matches = self.o2m_loss_rendered_mask and o2m_gt_matched.any()
+
         loss_rendered_mask = self.loss_rendered_mask(
             cls_scores.unflatten(0, (bs, num_query)),
             pts_preds.unflatten(0, (bs, num_query)), 
             labels.unflatten(0, (bs, num_query)), 
             pts_for_render_gt.unflatten(0, (bs, num_query)),
-            valid_mask.unflatten(0, (bs, num_query))
+            valid_mask.unflatten(0, (bs, num_query)),
+            gt_bev_mask,
+            reduction="sum" if o2m_matches else "mean"
         )
 
+        if o2m_matches:
+            o2m_gt_matched = o2m_gt_matched_by != -1
+            num_gts = torch.tensor([len(l) for l in gt_pts_list], device=o2m_gt_matched_by.device)
+            o2m_gt_matched_by += torch.arange(bs, device=num_gts.device).repeat_interleave(num_gts) * num_query
+            o2m_gt_matched_by = o2m_gt_matched_by[o2m_gt_matched]
+            o2m_pts_for_render_gt = normalize_2d_pts(gt_pts[o2m_gt_matched], self.pc_range)
+            o2m_pts_for_render_pred = pts_preds[o2m_gt_matched_by]
+            o2m_gt_bev_mask = gt_bev_mask.flatten(0,1)[o2m_gt_matched_by]
+            o2m_labels = gt_labels[o2m_gt_matched]
+            weight_norm = torch.cat([gt_bev_mask[valid_mask.unflatten(0, (bs, num_query))], o2m_gt_bev_mask]).to(float).mean()
+
+            o2m_loss_rendered_mask = self.o2m_loss_rendered_mask(
+                o2m_pts_for_render_pred, 
+                o2m_labels,
+                o2m_pts_for_render_gt,
+                o2m_gt_bev_mask,
+                o2m_gt_matched_by,
+                reduction='sum',
+                weight_norm=weight_norm
+            )
+            loss_rendered_mask = (loss_rendered_mask + o2m_loss_rendered_mask) / num_total_pos
+
         # direction regularization loss, self-supervised (by MapVR)
-        # dir_weights = pts_weights[:, :-self.dir_interval, 0]
         denormed_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range) if not self.z_cfg['gt_z_flag'] else denormalize_3d_pts(pts_preds, self.pc_range)
         denormed_pts_preds_dir = denormed_pts_preds[:,self.dir_interval:,:] - denormed_pts_preds[:,:-self.dir_interval,:]
-        # pts_targets_dir = pts_targets[:, self.dir_interval:,:] - pts_targets[:,:-self.dir_interval,:]
-        pts_targets_dir = denormed_pts_preds_dir
-        # loss_dir = self.loss_dir(
-        #     denormed_pts_preds_dir[isnotnan,:, :],
-        #     pts_targets_dir[isnotnan, :, :],
-        #     dir_weights[isnotnan,:],
-        #     avg_factor=num_total_pos
-        # )
-        loss_dir = self.loss_dir(
-            denormed_pts_preds_dir[isnotnan, 1:, :], 
-            pts_targets_dir[isnotnan, :-1, :],
-            dir_weights[isnotnan, 1:],
-            avg_factor=dir_weights[isnotnan, 1:].any(-1).sum()
-        )
+        if self.ssl_loss_dir:
+            pts_targets_dir = denormed_pts_preds_dir
+            loss_dir = self.loss_dir(
+                denormed_pts_preds_dir[isnotnan, 1:, :], 
+                pts_targets_dir[isnotnan, :-1, :],
+                dir_weights[isnotnan, 1:],
+                avg_factor=dir_weights[isnotnan, 1:].any(-1).sum()
+            )
+        else:
+            pts_targets_dir = pts_targets[:, self.dir_interval:,:] - pts_targets[:,:-self.dir_interval,:]
+            loss_dir = self.loss_dir(
+                denormed_pts_preds_dir[isnotnan,:, :],
+                pts_targets_dir[isnotnan, :, :],
+                dir_weights[isnotnan,:],
+                avg_factor=dir_weights[isnotnan, :].any(-1).sum()
+            )
+
 
         bboxes = denormalize_2d_bbox(bbox_preds, self.pc_range)
         # regression IoU loss, defaultly GIoU loss
@@ -771,6 +868,9 @@ class MapTRv2Head(DETRHead):
              gt_labels_list,
              gt_seg_mask,
              gt_pv_seg_mask,
+             bev_mask,
+             bev_label,
+             duplicate_of_gt_idx,
              preds_dicts,
              gt_bboxes_ignore=None,
              img_metas=None):
@@ -837,11 +937,17 @@ class MapTRv2Head(DETRHead):
         all_gt_pts_list = [gt_pts_list for _ in range(num_dec_layers)]
         all_gt_shifts_pts_list = [gt_shifts_pts_list for _ in range(num_dec_layers)]
         all_gt_bboxes_ignore_list = [gt_bboxes_ignore for _ in range(num_dec_layers)]
+        all_gt_bev_mask_list = [bev_mask for _ in range(num_dec_layers)]
+        all_gt_bev_label_list = [bev_label for _ in range(num_dec_layers)]
+        all_dup_gt_idx_list = [duplicate_of_gt_idx for _ in range(num_dec_layers)]
+        
+        batch_weight = bev_mask.to(float).mean() if bev_mask is not None and self.weight_mask else 1.0
+
 
         losses_cls, losses_bbox, losses_iou, losses_pts, losses_rendered_mask, losses_dir = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds, all_pts_preds,
             all_gt_bboxes_list, all_gt_labels_list, all_gt_pts_list, all_gt_shifts_pts_list,
-            all_gt_bboxes_ignore_list
+            all_gt_bboxes_ignore_list, all_gt_bev_mask_list, all_gt_bev_label_list, all_dup_gt_idx_list
         )
 
         loss_dict = dict()
@@ -852,8 +958,15 @@ class MapTRv2Head(DETRHead):
                     seg_output = preds_dicts['seg']
                     num_imgs = seg_output.size(0)
                     seg_gt = torch.stack([gt_seg_mask[i] for i in range(num_imgs)],dim=0)
-                    loss_seg = self.loss_seg(seg_output, seg_gt.float())
-                    loss_dict['loss_seg'] = loss_seg
+                    if self.loss_seg._get_name() == 'SimpleLoss':
+                        loss_seg = self.loss_seg(seg_output, seg_gt.float())
+                    elif self.loss_seg._get_name() == 'MaskedBCE':
+                        inter_bev_mask = F.interpolate(bev_mask.unsqueeze(1), size=(200, 100), mode='nearest')
+                        loss_seg = self.loss_seg(seg_output, seg_gt.float(), inter_bev_mask)
+                    else:
+                        raise NotImplementedError
+                    
+                    loss_dict['loss_seg'] = loss_seg*batch_weight
             if self.aux_seg['pv_seg']:
                 # import ipdb;ipdb.set_trace()
                 if preds_dicts['pv_seg'] is not None:
@@ -867,24 +980,24 @@ class MapTRv2Head(DETRHead):
             raise NotImplementedError("two_stage is not supported.")
 
         # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_iou'] = losses_iou[-1]
-        loss_dict['loss_pts'] = losses_pts[-1]
-        loss_dict['loss_rendered_mask'] = losses_rendered_mask[-1]
-        loss_dict['loss_dir'] = losses_dir[-1]
+        loss_dict['loss_cls'] = losses_cls[-1] * batch_weight
+        loss_dict['loss_bbox'] = losses_bbox[-1] * batch_weight
+        loss_dict['loss_iou'] = losses_iou[-1] * batch_weight
+        loss_dict['loss_pts'] = losses_pts[-1] * batch_weight
+        loss_dict['loss_rendered_mask'] = losses_rendered_mask[-1] * batch_weight
+        loss_dict['loss_dir'] = losses_dir[-1] * batch_weight
 
         # loss from other decoder layers
         num_dec_layer = 0
         for loss_cls_i, loss_bbox_i, loss_iou_i, loss_pts_i, loss_rendered_mask_i, loss_dir_i in \
         zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1], losses_pts[:-1], losses_rendered_mask[:-1], losses_dir[:-1]):
 
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
-            loss_dict[f'd{num_dec_layer}.loss_pts'] = loss_pts_i
-            loss_dict[f'd{num_dec_layer}.loss_rendered_mask'] = loss_rendered_mask_i
-            loss_dict[f'd{num_dec_layer}.loss_dir'] = loss_dir_i
+            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i * batch_weight
+            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i * batch_weight
+            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i * batch_weight
+            loss_dict[f'd{num_dec_layer}.loss_pts'] = loss_pts_i * batch_weight
+            loss_dict[f'd{num_dec_layer}.loss_rendered_mask'] = loss_rendered_mask_i * batch_weight
+            loss_dict[f'd{num_dec_layer}.loss_dir'] = loss_dir_i * batch_weight
 
             num_dec_layer += 1
 

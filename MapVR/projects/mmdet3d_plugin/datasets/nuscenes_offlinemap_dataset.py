@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapTRv2 (e03f097)
+#   (https://github.com/hustvl/MapTR/tree/e03f097abef19e1ba3fed5f471a8d80fbfa0a064)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 import copy
 
 import numpy as np
@@ -12,6 +21,7 @@ import numpy as np
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from .nuscnes_eval import NuScenesEval_custom
 from projects.mmdet3d_plugin.models.utils.visual import save_tensor
+from projects.mmdet3d_plugin.bevformer.apis.test import mask_gt
 from mmcv.parallel import DataContainer as DC
 import random
 
@@ -604,8 +614,8 @@ class VectorizedLocalMap(object):
                     gt_pv_semantic_mask = np.zeros((num_cam, 1, img_shape[0] // feat_down_sample, img_shape[1] // feat_down_sample), dtype=np.uint8)
                     lidar2img = example['img_metas'].data['lidar2img']
                     scale_factor = np.eye(4)
-                    scale_factor[0, 0] *= 1/32
-                    scale_factor[1, 1] *= 1/32
+                    scale_factor[0, 0] *= 1/feat_down_sample
+                    scale_factor[1, 1] *= 1/feat_down_sample
                     lidar2feat = [scale_factor @ l2i for l2i in lidar2img]
                 else:
                     gt_pv_semantic_mask = None
@@ -631,8 +641,8 @@ class VectorizedLocalMap(object):
                     gt_pv_semantic_mask = np.zeros((num_cam, len(self.vec_classes), img_shape[0] // feat_down_sample, img_shape[1] // feat_down_sample), dtype=np.uint8)
                     lidar2img = example['img_metas'].data['lidar2img']
                     scale_factor = np.eye(4)
-                    scale_factor[0, 0] *= 1/32
-                    scale_factor[1, 1] *= 1/32
+                    scale_factor[0, 0] *= 1/feat_down_sample
+                    scale_factor[1, 1] *= 1/feat_down_sample
                     lidar2feat = [scale_factor @ l2i for l2i in lidar2img]
                 else:
                     gt_pv_semantic_mask = None
@@ -681,7 +691,7 @@ class VectorizedLocalMap(object):
         ones = np.ones((pts_num,1))
         lidar_coords = np.concatenate([coords,zeros,ones], axis=1).transpose(1,0)
         pix_coords = perspective(lidar_coords, lidar2feat)
-        cv2.polylines(mask, np.int32([pix_coords]), False, color=color, thickness=thickness)
+        cv2.polylines(mask, np.int32([pix_coords]), False, color=color, thickness=thickness) #inplace!
         
     def line_ego_to_mask(self, 
                          line_ego, 
@@ -706,7 +716,7 @@ class VectorizedLocalMap(object):
         coords = coords.reshape((-1, 2))
         assert len(coords) >= 2
         
-        cv2.polylines(mask, np.int32([coords]), False, color=color, thickness=thickness)
+        cv2.polylines(mask, np.int32([coords]), False, color=color, thickness=thickness) # inplace
 
     def get_map_geom(self, patch_box, patch_angle, layer_names, location):
         map_geom = []
@@ -1120,6 +1130,15 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
             'gt_vecs_pts_num': list[num_vecs], vec with num_points
             'gt_vecs_label': list[num_vecs], vec with cls index
         '''
+
+
+        # add additional pseudo rendering if available
+        if "bev_mask" in input_dict:
+            example["bev_mask"] = to_tensor(input_dict["bev_mask"])
+        if "bev_label" in input_dict:
+            example["bev_label"] = to_tensor(input_dict["bev_label"])
+        
+
         gt_vecs_label = to_tensor(anns_results['gt_vecs_label'])
         if isinstance(anns_results['gt_vecs_pts_loc'], LiDARInstanceLines):
             gt_vecs_pts_loc = anns_results['gt_vecs_pts_loc']
@@ -1645,6 +1664,176 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         if show:
             self.show(results, out_dir, pipeline=pipeline)
         return results_dict
+    
+
+    def evaluate_with_pseudo_mask(self,
+                 results,
+                 metric='bbox',
+                 logger=None,
+                 jsonfile_prefix=None,
+                 result_names=['pts_bbox'],
+                 show=False,
+                 out_dir=None,
+                 pipeline=None):
+        """Evaluation in nuScenes protocol.
+
+        Args:
+            results (list[dict]): Testing results of the dataset.
+            metric (str | list[str]): Metrics to be evaluated.
+            logger (logging.Logger | str | None): Logger used for printing
+                related information during evaluation. Default: None.
+            jsonfile_prefix (str | None): The prefix of json files. It includes
+                the file path and the prefix of filename, e.g., "a/b/prefix".
+                If not specified, a temp file will be created. Default: None.
+            show (bool): Whether to visualize.
+                Default: False.
+            out_dir (str): Path to save the visualization results.
+                Default: None.
+            pipeline (list[dict], optional): raw data loading for showing.
+                Default: None.
+
+        Returns:
+            dict[str, float]: Results of each evaluation metric.
+        """
+        from copy import deepcopy
+        # extract bev_mask
+        masks = []
+        extracted_results = []
+        for elem in results:
+            masks.append(elem['bev_mask'])
+            extracted_results.append(deepcopy(elem))
+            extracted_results[-1].pop('bev_mask')
+        results = extracted_results
+
+
+        result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
+
+        if isinstance(result_files, dict):
+            results_dict = dict()
+            for name in result_names:
+                print('Evaluating bboxes of {}'.format(name))
+                ret_dict = self._evaluate_single_masked(result_files[name], masks, metric=metric)
+            results_dict.update(ret_dict)
+        elif isinstance(result_files, str):
+            results_dict = self._evaluate_single_masked(result_files, masks, metric=metric)
+
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+
+        if show:
+            self.show(results, out_dir, pipeline=pipeline)
+        return results_dict
+
+
+    def _evaluate_single_masked(self,
+                         result_path,
+                         masks,
+                         logger=None,
+                         metric='chamfer',
+                         result_name='pts_bbox'):
+        """Evaluation for a single model in nuScenes protocol.
+
+        Args:
+            result_path (str): Path of the result file.
+            logger (logging.Logger | str | None): Logger used for printing
+                related information during evaluation. Default: None.
+            metric (str): Metric name used for evaluation. Default: 'bbox'.
+            result_name (str): Result name in the metric prefix.
+                Default: 'pts_bbox'.
+
+        Returns:
+            dict: Dictionary of evaluation details.
+        """
+        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import eval_map
+        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import format_res_gt_by_classes
+        result_path = osp.abspath(result_path)
+        detail = dict()
+        
+        print('Formating results & gts by classes')
+        with open(result_path,'r') as f:
+            pred_results = json.load(f)
+        gen_results = pred_results['results']
+        with open(self.map_ann_file,'r') as ann_f:
+            gt_anns = json.load(ann_f)
+        annotations = gt_anns['GTs']
+
+        # mask GT
+        for i, gt_item in enumerate(annotations):
+            annotations[i] = mask_gt(gt_item, masks[i], self.pc_range, self.fixed_num, resample=True)
+
+        cls_gens, cls_gts = format_res_gt_by_classes(result_path,
+                                                     gen_results,
+                                                     annotations,
+                                                     cls_names=self.MAPCLASSES,
+                                                     num_pred_pts_per_instance=self.fixed_num,
+                                                     eval_use_same_gt_sample_num_flag=self.eval_use_same_gt_sample_num_flag,
+                                                     pc_range=self.pc_range)
+
+        metrics = metric if isinstance(metric, list) else [metric]
+        allowed_metrics = ['chamfer', 'iou']
+        for metric in metrics:
+            if metric not in allowed_metrics:
+                raise KeyError(f'metric {metric} is not supported')
+
+        for metric in metrics:
+            print('-*'*10+f'use metric:{metric}'+'-*'*10)
+
+            if metric == 'chamfer':
+                thresholds = [0.5,1.0,1.5]
+            elif metric == 'iou':
+                thresholds= np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
+            cls_aps = np.zeros((len(thresholds),self.NUM_MAPCLASSES))
+
+            for i, thr in enumerate(thresholds):
+                print('-*'*10+f'threshhold:{thr}'+'-*'*10)
+                mAP, cls_ap = eval_map(
+                                gen_results,
+                                annotations,
+                                cls_gens,
+                                cls_gts,
+                                threshold=thr,
+                                cls_names=self.MAPCLASSES,
+                                logger=logger,
+                                num_pred_pts_per_instance=self.fixed_num,
+                                pc_range=self.pc_range,
+                                metric=metric)
+                for j in range(self.NUM_MAPCLASSES):
+                    cls_aps[i, j] = cls_ap[j]['ap']
+
+            for i, name in enumerate(self.MAPCLASSES):
+                print('{}: {}'.format(name, cls_aps.mean(0)[i]))
+                detail['NuscMap_{}/{}_AP'.format(metric,name)] =  cls_aps.mean(0)[i]
+            print('map: {}'.format(cls_aps.mean(0).mean()))
+            detail['NuscMap_{}/mAP'.format(metric)] = cls_aps.mean(0).mean()
+
+            for i, name in enumerate(self.MAPCLASSES):
+                for j, thr in enumerate(thresholds):
+                    if metric == 'chamfer':
+                        detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
+                    elif metric == 'iou':
+                        if thr == 0.5 or thr == 0.75:
+                            detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
+
+        return detail
+
+@DATASETS.register_module()
+class SubsetMapDataset(CustomNuScenesOfflineLocalMapDataset):
+    def __init__(self, scenesplit_filepath, subset_ratio, constant_seed=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        rand_generator = torch.Generator()
+        if constant_seed:
+            rand_generator.manual_seed(0)
+        else:
+            rand_generator.seed()
+
+        with open(scenesplit_filepath, "r") as f:
+            all_scenes = f.read().splitlines()
+
+        scene_idx = torch.randperm(len(all_scenes), generator=rand_generator)[:int(subset_ratio * len(all_scenes))].tolist()
+        self.scene_tokens = [all_scenes[idx] for idx in scene_idx]
+        self.subset_ratio = subset_ratio
+        self.data_infos = [info for info in self.data_infos if info["scene_token"] in self.scene_tokens]
+        self._set_group_flag() # update self.flag to account for the new data_infos
 
 
 def output_to_vecs(detection):

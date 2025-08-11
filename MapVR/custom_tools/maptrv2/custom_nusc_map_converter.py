@@ -1,3 +1,12 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from MapTRv2 (e03f097)
+#   (https://github.com/hustvl/MapTR/tree/e03f097abef19e1ba3fed5f471a8d80fbfa0a064)
+# Copyright (c) 2022 Hust Vision Lab, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+
 import argparse
 from os import path as osp
 import sys
@@ -237,6 +246,17 @@ def obtain_sensor2top(nusc,
     return sweep
 
 
+def load_geo_split_scenes(splits=["train", "val", "test"]):
+
+    all_scenes = set()
+    for split in splits:
+        with open(f"custom_tools/maptrv2/geosplits/near/{split}.txt", "r") as f:
+            split_set = set(f.read().splitlines())
+        all_scenes.update(split_set)
+
+    return all_scenes
+
+
 def _fill_trainval_infos(nusc,
                          nusc_can_bus,
                          nusc_maps, 
@@ -250,8 +270,8 @@ def _fill_trainval_infos(nusc,
 
     Args:
         nusc (:obj:`NuScenes`): Dataset class in the nuScenes dataset.
-        train_scenes (list[str]): Basic information of training scenes.
-        val_scenes (list[str]): Basic information of validation scenes.
+        train_scenes (set[str]): Basic information of training scenes.
+        val_scenes (set[str]): Basic information of validation scenes.
         test (bool): Whether use the test mode. In the test mode, no
             annotations can be accessed. Default: False.
         max_sweeps (int): Max number of sweeps. Default: 10.
@@ -263,7 +283,11 @@ def _fill_trainval_infos(nusc,
     train_nusc_infos = []
     val_nusc_infos = []
     frame_idx = 0
+    trainval_scenes = train_scenes | val_scenes
     for sample in mmcv.track_iter_progress(nusc.sample):
+        if sample["scene_token"] not in trainval_scenes:
+            continue
+
         map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
 
         lidar_token = sample['data']['LIDAR_TOP']
@@ -758,7 +782,8 @@ def create_nuscenes_infos(root_path,
                           can_bus_root_path,
                           info_prefix,
                           version='v1.0-trainval',
-                          max_sweeps=10):
+                          max_sweeps=10,
+                          use_geo_split=False):
     """Create info file of nuscene dataset.
 
     Given the raw data, generate its related info file in pkl format.
@@ -770,11 +795,21 @@ def create_nuscenes_infos(root_path,
             Default: 'v1.0-trainval'
         max_sweeps (int): Max number of sweeps.
             Default: 10
+        use_geo_split (bool): Whether to use geo split in
+            custom_tools/maptrv2/geosplits/near.
+            Default: False
     """
     from nuscenes.nuscenes import NuScenes
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
-    print(version, root_path)
-    nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
+    if use_geo_split:
+        print("geo split", root_path)
+        nuscs = [
+            NuScenes(version="v1.0-trainval", dataroot=root_path, verbose=True),
+            NuScenes(version="v1.0-test", dataroot=root_path, verbose=True),
+        ]
+    else:
+        print(version, root_path)
+        nuscs = [NuScenes(version=version, dataroot=root_path, verbose=True)]
     nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
     MAPS = ['boston-seaport', 'singapore-hollandvillage',
                      'singapore-onenorth', 'singapore-queenstown']
@@ -789,19 +824,21 @@ def create_nuscenes_infos(root_path,
     available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
     assert version in available_vers
     if version == 'v1.0-trainval':
-        train_scenes = splits.train
-        val_scenes = splits.val
+        train_scenes = load_geo_split_scenes(splits=["train"]) if use_geo_split else set(splits.train)
+        val_scenes = load_geo_split_scenes(splits=["val"]) if use_geo_split else set(splits.val)
     elif version == 'v1.0-test':
-        train_scenes = splits.test
-        val_scenes = []
+        train_scenes = load_geo_split_scenes(splits=["test"]) if use_geo_split else set(splits.test)
+        val_scenes = set()
     elif version == 'v1.0-mini':
-        train_scenes = splits.mini_train
-        val_scenes = splits.mini_val
+        if use_geo_split:
+            raise NotImplementedError('Geo split not supported for mini yet')
+        train_scenes = set(splits.mini_train)
+        val_scenes = set(splits.mini_val)
     else:
         raise ValueError('unknown')
 
     # filter existing scenes.
-    available_scenes = get_available_scenes(nusc)
+    available_scenes = sum([get_available_scenes(nusc) for nusc in nuscs], [])
     available_scene_names = [s['name'] for s in available_scenes]
     train_scenes = list(
         filter(lambda x: x in available_scene_names, train_scenes))
@@ -822,8 +859,13 @@ def create_nuscenes_infos(root_path,
         print('train scene: {}, val scene: {}'.format(
             len(train_scenes), len(val_scenes)))
 
-    train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
-        nusc, nusc_can_bus, nusc_maps, map_explorer, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
+    train_nusc_infos = []
+    val_nusc_infos = []
+    for nusc in nuscs:
+        train_nusc_info, val_nusc_info = _fill_trainval_infos(
+            nusc, nusc_can_bus, nusc_maps, map_explorer, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
+        train_nusc_infos += train_nusc_info
+        val_nusc_infos += val_nusc_info
 
     metadata = dict(version=version)
     if test:
@@ -852,7 +894,8 @@ def nuscenes_data_prep(root_path,
                        version,
                        dataset_name,
                        out_dir,
-                       max_sweeps=10):
+                       max_sweeps=10,
+                       use_geo_split=False):
     """Prepare data related to nuScenes dataset.
 
     Related data consists of '.pkl' files recording basic infos,
@@ -867,7 +910,8 @@ def nuscenes_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
     create_nuscenes_infos(
-        root_path, out_dir, can_bus_root_path, info_prefix, version=version, max_sweeps=max_sweeps)
+        root_path, out_dir, can_bus_root_path, info_prefix,
+        version=version, max_sweeps=max_sweeps, use_geo_split=use_geo_split)
 
     # if version == 'v1.0-test':
     #     info_test_path = osp.join(
@@ -894,6 +938,11 @@ parser.add_argument(
     type=str,
     default='./data/kitti',
     help='specify the root path of dataset')
+parser.add_argument(
+    "--use-geo-split",
+    action='store_true',
+    help="Whether to use only geo scenes"
+)
 parser.add_argument(
     '--canbus',
     type=str,
@@ -932,7 +981,8 @@ if __name__ == '__main__':
         version=train_version,
         dataset_name='NuScenesDataset',
         out_dir=args.out_dir,
-        max_sweeps=args.max_sweeps)
+        max_sweeps=args.max_sweeps,
+        use_geo_split=args.use_geo_split)
     test_version = f'{args.version}-test'
     nuscenes_data_prep(
         root_path=args.root_path,
@@ -941,4 +991,5 @@ if __name__ == '__main__':
         version=test_version,
         dataset_name='NuScenesDataset',
         out_dir=args.out_dir,
-        max_sweeps=args.max_sweeps)
+        max_sweeps=args.max_sweeps,
+        use_geo_split=args.use_geo_split)

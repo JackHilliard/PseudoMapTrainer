@@ -6,3 +6,4 @@ from .map_loss import OrderedPtsSmoothL1Cost, OrderedPtsL1Loss
 from .map_loss import PtsDirCosLoss
 from .map_loss import RenderedMaskDiceLoss, RenderedMaskDiceCost
 from .diff_ras import SoftLane, SoftPolygon
+from .simple_loss import SimpleLoss

@@ -1,11 +1,32 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from RoMe (188fd42)
+#   (https://github.com/DRosemei/RoMe/blob/188fd42d0bf5324d6dd7a48758eef6c81a04d8fe/scripts/mask2former_infer/inference.py)
+# Copyright (c) 2023 Horizon Robotics, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detectron2/blob/master/demo/demo.py
-from kitti_dataset import CrawlKittiDataPath
-from nuscenes_scenes import crawl_scenes_paths
-from nuscenes_dataset import CrawlNuScenesDataPath
-from predictor import VisualizationDemo
+from nuscenes_scenes import crawl_nusc_scenes_paths
+
+from detectron2.data import DatasetCatalog
+from detectron2.engine import (
+    DefaultTrainer,
+    default_argument_parser,
+    default_setup,
+    launch,
+)
+import torch
+# fmt: off
+import sys, os
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
+# fmt: on
+
+
 from mask2former import add_maskformer2_config
 from detectron2.utils.logger import setup_logger
+from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.projects.deeplab import add_deeplab_config
 from detectron2.data.detection_utils import read_image
 from detectron2.config import get_cfg
@@ -14,75 +35,57 @@ from pathlib import Path
 import tqdm
 import numpy as np
 import cv2
-import warnings
-import time
 import tempfile
 import argparse
-import glob
 import multiprocessing as mp
-import os
-from poplib import CR
 
-# fmt: off
-import sys
-from turtle import pd
-sys.path.insert(1, os.path.join(sys.path[0], '..'))
-# fmt: on
-
-
-# constants
-WINDOW_NAME = "mask2former demo"
-
-
-def setup_cfg(args):
-    # load config from file and command-line arguments
+def setup(args):
+    """
+    Create configs and perform basic setups.
+    """
     cfg = get_cfg()
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
+    default_setup(cfg, args)
     return cfg
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="maskformer2 demo for builtin configs")
-    parser.add_argument(
-        "--config-file",
-        default="configs/coco/panoptic-segmentation/maskformer2_R50_bs16_50ep.yaml",
-        metavar="FILE",
-        help="path to config file",
-    )
-    parser.add_argument("--webcam", action="store_true", help="Take inputs from webcam.")
-    parser.add_argument("--video-input", help="Path to video file.")
+    """
+    Create a parser for command-line arguments optionally based on a initial parser.
+    If `parser` is None, a new one is created.
+    """
+    parser = default_argument_parser()
     parser.add_argument(
         "--base_dir",
         default="#####/Nuscenes/sweeps/",  # "samples" contain key frames
         help="nuScenes base dir",
     )
-
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Whether to overwrite the output file if it exists. Default is False",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="nuScenes version (trainval, mini, test). " \
+        "If None, the whole dataset will be used.",
+    )
     parser.add_argument(
         "--save_dir",
         default="#####/KittiOdom/sequences",
         help="nuScenes base dir",
     )
     parser.add_argument(
-        "--output",
-        help="A file or directory to save output visualizations. "
-        "If not given, will show output in an OpenCV window.",
-    )
-
-    parser.add_argument(
-        "--confidence-threshold",
-        type=float,
-        default=0.5,
-        help="Minimum score for instance predictions to be shown",
-    )
-    parser.add_argument(
-        "--opts",
-        help="Modify config options using the command-line 'KEY VALUE' pairs",
+        "--scene_names",
+        type=str,
+        nargs="+",
         default=[],
-        nargs=argparse.REMAINDER,
+        help="Names of all scenes to infer (e.g. 'scene-0063' 'scene-0064' 'scene-0200'). Default means that the whole dataset should be labeled"
     )
     return parser
 
@@ -103,65 +106,72 @@ def test_opencv_video_format(codec, file_ext):
             return True
         return False
 
+def get_dict(file_paths, label_paths, overwrite=False):
+    dataset_dicts = []
+    for img_path, label_path in zip(file_paths, label_paths):
+        if overwrite or not os.path.isfile(label_path):
+            dataset_dicts.append({
+                "file_name": img_path
+            })
+    return dataset_dicts
 
-if __name__ == "__main__":
+
+def register_dataset(name:str, file_paths, label_paths, overwrite=False):
+    DatasetCatalog.register(
+        name, lambda: get_dict(file_paths, label_paths, overwrite=overwrite)
+    )
+
+
+def main(args):
     mp.set_start_method("spawn", force=True)
-    args = get_parser().parse_args()
     setup_logger(name="fvcore")
     logger = setup_logger()
     logger.info("Arguments: " + str(args))
 
-    cfg = setup_cfg(args)
+    cfg = setup(args)
+    model = DefaultTrainer.build_model(cfg)
+    DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+        cfg.MODEL.WEIGHTS, resume=args.resume
+    )
+    model.eval()
+    base_dir = str(Path(args.base_dir).expanduser().resolve())
+    save_dir = str(Path(args.save_dir).expanduser().resolve())
 
-    demo = VisualizationDemo(cfg)
-    # camera_names = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-    #                 "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
-    # camera_names = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT"]
-    # camera_names = ["CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
-    # # create output dir
-    # for cam in camera_names:
-    #     cam_path = join(args.save_dir, cam)
-    #     Path(cam_path).mkdir(parents=True, exist_ok=True)
-    #     cam_path = cam_path.replace("/CAM", "/seg_CAM")
-    #     Path(cam_path).mkdir(parents=True, exist_ok=True)
-    #     cam_path = cam_path.replace("/seg_CAM", "/vis_seg_CAM")
-    #     Path(cam_path).mkdir(parents=True, exist_ok=True)
-    # # Nuscenes
-    # file_paths = CrawlNuScenesDataPath(args.base_dir, camera_names)
+    camera_names = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+                    "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
 
-    # root_dir = "#####/Nuscenes"
-    # version = "mini"
-    # scenes = ["scene-0655"]
-    # camera_names = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-    #                 "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
-    # file_paths = crawl_scenes_paths(root_dir, version, scenes, camera_names)
+    crawl_func = crawl_nusc_scenes_paths
+    get_label_path = lambda img_path: img_path.replace(base_dir, save_dir).replace("/CAM", "/seg_CAM").replace(".jpg", ".png")
 
-    # save_paths = [file_path.replace(args.base_dir, args.save_dir)  for file_path in file_paths]
+    file_paths = crawl_func(base_dir, camera_names, args.split, args.scene_names)
+    label_save_paths = [get_label_path(img_path) for img_path in file_paths]
+    output_folder_paths = set([os.path.dirname(label_path) for label_path in label_save_paths])
+    for output_folder_path in output_folder_paths:
+        Path(output_folder_path).mkdir(parents=True, exist_ok=True)
 
-    # vis_label_save_paths = [save_path.replace("/CAM", "/vis_seg_CAM")  for save_path in save_paths]
+    register_dataset('nuscenes', file_paths, label_save_paths, overwrite=args.overwrite)
+    data_loader = DefaultTrainer.build_test_loader(cfg, 'nuscenes')
+    
+    for inputs in tqdm.tqdm(data_loader):
+        with torch.no_grad():
+            outputs = model(inputs)
+        for k, output in enumerate(outputs):
+            save_img = output["sem_seg"].argmax(dim=0).cpu()
+            img_path = inputs[k]["file_name"]
+            seg_save_path = get_label_path(img_path)
+            successful_write = cv2.imwrite(seg_save_path, save_img.numpy())
+            if not successful_write:
+                logger.error(f"Failed to save label to {seg_save_path}")
 
-    # label_save_paths = [save_path.replace("/CAM", "/seg_CAM")  for save_path in save_paths]
-    # label_save_paths = [label_save_path.replace(".jpg", ".png")  for label_save_path in label_save_paths]
 
-    # Kitti
-    base_dir = "#####/KittiOdom/sequences"
-    save_dir = "#####/KittiOdom/seg_sequences"
-    vis_dir = "#####/KittiOdom/vis_seg_sequences"
-    sequences = ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10"]
-    for sequence in sequences:
-        sequence_path = join(save_dir, sequence, "image_3")
-        Path(sequence_path).mkdir(parents=True, exist_ok=True)
-
-    file_paths = CrawlKittiDataPath(base_dir, sequences, "image_3")
-    label_save_paths = [file_path.replace(base_dir, save_dir) for file_path in file_paths]
-    vis_label_save_paths = [file_path.replace(base_dir, vis_dir) for file_path in file_paths]
-    for i in tqdm.tqdm(range(len(file_paths))):
-        # use PIL, to be consistent with evaluation
-        source_name = file_paths[i]
-        # vis_label_name = vis_label_save_paths[i]
-        label_name = label_save_paths[i]
-        img = read_image(source_name, format="BGR")
-        predictions, visualized_output = demo.run_on_image(img)
-        # visualized_output.save(vis_label_name)
-        save_img = predictions["sem_seg"].argmax(dim=0).cpu().numpy()  # (H, W)
-        cv2.imwrite(label_name, save_img)
+if __name__ == "__main__":
+    args = get_parser().parse_args()
+    print("Command Line Args:", args)
+    launch(
+        main,
+        args.num_gpus,
+        num_machines=args.num_machines,
+        machine_rank=args.machine_rank,
+        dist_url=args.dist_url,
+        args=(args,),
+    )

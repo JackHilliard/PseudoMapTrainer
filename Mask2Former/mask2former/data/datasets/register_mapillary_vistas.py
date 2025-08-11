@@ -1,4 +1,11 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from Mask2Former (9b0651c)
+#   (https://github.com/facebookresearch/Mask2Former/tree/9b0651c6c1d5b3af2e6da0589b719c514ec0d69a)
+# Copyright (c) Facebook, Inc. and its affiliates, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import os
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
@@ -489,8 +496,8 @@ def register_all_mapillary_vistas(root):
     meta = _get_mapillary_vistas_meta()
     for name, dirname in [("train", "training"), ("val", "validation")]:
         image_dir = os.path.join(root, dirname, "images")
-        gt_dir = os.path.join(root, dirname, "labels")
-        name = f"mapillary_vistas_sem_seg_{name}"
+        gt_dir = os.path.join(root, dirname, "v1.2", "labels")
+        name = f"mapillary_vistas_v1.2_sem_seg_{name}"
         DatasetCatalog.register(
             name, lambda x=image_dir, y=gt_dir: load_sem_seg(y, x, gt_ext="png", image_ext="jpg")
         )

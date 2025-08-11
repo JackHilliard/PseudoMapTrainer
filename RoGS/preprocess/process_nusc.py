@@ -1,5 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
+
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from RoGS (a214497)
+#   (https://github.com/fzhiheng/RoGS/tree/a21449733c157ca2d58adfc3b8c2225a624ee466)
+# Copyright 2024 Zhiheng Feng, licensed under the Apache-2.0 license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import os
 import argparse
 from typing import List
@@ -7,6 +16,8 @@ from typing import List
 
 import cv2
 import numpy as np
+import yaml
+import addict
 from tqdm import tqdm
 import scipy.sparse as sp
 from plyfile import PlyData, PlyElement
@@ -14,9 +25,13 @@ from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
 from pyquaternion import Quaternion
 from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.splits import create_splits_scenes
 
-from datasets.nusc import get_nusc_filted_color_map, get_nusc_label_remaps, label2mask
+from datasets.base import get_dataset_cls
+from datasets.nusc import NuscDataset
+from datasets.label_mappings.label_mapping import get_label_mapping, LabelMapping
 from utils.visualizer import depth2color
+from utils.image import render_semantic
 
 
 def get_pointcloud_to_world(nusc, samp_token, filter_sky=True) -> LidarPointCloud:
@@ -83,25 +98,12 @@ def worldpoint2camera(nusc, pc: LidarPointCloud, camera_token, min_dist: float =
     return uv, depths, image, mask
 
 
-def render_semantic(label):
-    label_bgr = cv2.cvtColor(label.astype("uint8"), cv2.COLOR_GRAY2BGR)
-    rendered_label = np.array(cv2.LUT(label_bgr, get_nusc_filted_color_map()))
-    return rendered_label
-
-
-def remap_semantic(semantic_label):
-    semantic_label = semantic_label.astype('uint8')
-    remaped_label = np.array(cv2.LUT(semantic_label, get_nusc_label_remaps()))
-    return remaped_label
-
-
-def generate_cam_depth(nusc, cam_name, all_lidars: List[LidarPointCloud], lidar_times, depth_save_root, seg_root, use_all_frame=False,
-                       lidar_frame_range=(-5, 0),
-                       vis=False):
+def generate_cam_depth(nusc, cam_name, all_lidars: List[LidarPointCloud], lidar_times, depth_save_root, seg_root,
+                       label_mapping: LabelMapping, use_all_frame=False, lidar_frame_range=(-5, 0), vis=False):
     records = [samp for samp in nusc.sample if nusc.get("scene", samp["scene_token"])["name"] in scene_name]
     records.sort(key=lambda x: (x['timestamp']))
     current_point_cloud = LidarPointCloud(points=np.concatenate([lidar.points for lidar in all_lidars], axis=1))
-    for rec in tqdm(records):
+    for rec in records:
         samp = nusc.get("sample_data", rec["data"][cam_name])
         flag = True
         while flag or not samp["is_key_frame"]:
@@ -126,7 +128,7 @@ def generate_cam_depth(nusc, cam_name, all_lidars: List[LidarPointCloud], lidar_
             os.makedirs(current_depth_root, exist_ok=True)
 
             label_image = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)
-            mask, label = label2mask(label_image)
+            mask, label = label_mapping.label2mask(label_image)
 
             uv, depth, im, _ = worldpoint2camera(nusc, current_point_cloud, samp["token"])
 
@@ -145,8 +147,8 @@ def generate_cam_depth(nusc, cam_name, all_lidars: List[LidarPointCloud], lidar_
             # 可视化深度图
             vis_render_depth = depth2color(depth_img, depth_img > 0)
             vis_render_depth = cv2.cvtColor(vis_render_depth, cv2.COLOR_RGB2BGR)
-            remap_label = remap_semantic(label).astype(int)
-            gt_lable = render_semantic(remap_label)  # RGB fomat
+            remap_label = label_mapping.remap_semantic(label).astype(int)
+            gt_lable = render_semantic(remap_label, label_mapping.color_map)  # RGB fomat
             gt_lable = cv2.cvtColor(gt_lable, cv2.COLOR_RGB2BGR)
             blend = cv2.addWeighted(im, 0.5, gt_lable, 0.5, 0)
             blend[depth_img > 0] = vis_render_depth[depth_img > 0]
@@ -168,33 +170,65 @@ def generate_cam_depth(nusc, cam_name, all_lidars: List[LidarPointCloud], lidar_
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate nuscenes dataset")
-    parser.add_argument("--nusc_root", type=str, default="/dataset/nuScenes/v1.0-mini", help="nuscenes dataset root")
-    parser.add_argument("--seg_root", type=str, default="/dataset/nuScenes/nuScenes_clip", help="nuscenes dataset root")
-    parser.add_argument("--save_root", type=str, default="/dataset/nuScenes", help="nuscenes dataset root")
-    parser.add_argument("-v","--version", type=str, default="mini", help="nuscenes dataset root")
-    parser.add_argument("--scene_name", type=str, default="scene-0655", help="scene name")
-    parser.add_argument("--scene_names", type=str, nargs="+", default=None, help="scene name")
+    parser.add_argument('--config', help='config yaml path')
     parser.add_argument("--depth", action="store_true", help="generate depth image")
     parser.add_argument("-a", "--depth_use_all_lidar", action="store_true", help="use all lidar frames when generating depth image for a image")
     parser.add_argument("-r", "--lidar_frame_range", type=int, nargs=2, default=(-5, 0), help="lidar frame range")
-    args = parser.parse_args()
+    parser.add_argument("--skip_processed", action="store_true", help="skip already processed scene")
+    parser.add_argument("--skip_missing_labels", action="store_true",
+                        help="skip scenes, where no segmentation labels are available. Otherwise, the script will raise an error.")
 
-    nusc_root = args.nusc_root
-    seg_root = args.seg_root
-    save_root = args.save_root
+    args = parser.parse_args()
+    with open(args.config) as file:
+        configs = yaml.safe_load(file)
+    configs["file"] = os.path.abspath(args.config)
+    configs = addict.Dict(configs)
+
+    label_mapping = get_label_mapping(configs.dataset.label_mapping)
+    Dataset = get_dataset_cls(configs.dataset.dataset)
+    assert issubclass(Dataset, NuscDataset), "Dataset must be a NuscDataset"
+
+    nusc_root = configs.dataset.base_dir
+    seg_root = configs.dataset.label_dir
+    save_root = os.path.dirname(configs.dataset.road_gt_dir)
     gt_root = os.path.join(save_root, "nuScenes_road_gt")
     os.makedirs(gt_root, exist_ok=True)
 
     all_cam_names = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
 
-    nusc = NuScenes(version=f"v1.0-{args.version}", dataroot=nusc_root, verbose=True)
-    # print(f"all scene: {[x['name'] for x in nusc.scene]}")
-    
-    print(f"scene_names: {args.scene_names}")
-    for scene_name in args.scene_names:
 
-    # scene_name = args.scene_name
+    nusc_all = {
+        "trainval": NuScenes(version="v1.0-trainval", dataroot=nusc_root),
+        "test": NuScenes(version="v1.0-test", dataroot=nusc_root)
+    }
+    splits = create_splits_scenes()
+    trainval_scenes = splits["train"] + splits["val"]
+    test_scenes = splits["test"]
 
+    scene_names = configs.dataset.clip_list
+
+    if scene_names is None:
+        all_scenes = trainval_scenes + test_scenes
+
+        scene_names = [
+            scene for scene in
+            all_scenes[len(all_scenes)*configs.pre_processing.percent_of_data_start//100 : len(all_scenes)*configs.pre_processing.percent_of_data_end//100]
+        ]
+
+    if len(scene_names) < 10:
+        print(f"scene_names: {scene_names}")
+    else:
+        print(f"scene_names: {scene_names[:5]} ... {scene_names[-5:]}")
+
+    for scene_name in tqdm(scene_names):
+
+        if args.skip_processed:
+            # check if the scene is already processed and skip processing if it is
+            gt_ply_path = os.path.join(gt_root, f"{scene_name}.ply")
+            if os.path.exists(gt_ply_path):
+                continue
+
+        nusc = nusc_all["trainval"] if scene_name in trainval_scenes else nusc_all["test"]
         records = [samp for samp in nusc.sample if nusc.get("scene", samp["scene_token"])["name"] in scene_name]
         records.sort(key=lambda x: (x['timestamp']))
 
@@ -234,75 +268,82 @@ if __name__ == "__main__":
         lidar_times = np.array(lidar_times)
 
         # ====> generate road ground truth
-        all_labels_points = dict()
-        for i in tqdm(range(len(all_lidars))):
-            lidar = all_lidars[i]
-            lidar_time = lidar_times[i]
-            point_num = lidar.points.shape[1]
-            current_point = lidar.points[:3, :].T
+        try:
+            all_labels_points = dict()
+            for i in range(len(all_lidars)):
+                lidar = all_lidars[i]
+                lidar_time = lidar_times[i]
+                point_num = lidar.points.shape[1]
+                current_point = lidar.points[:3, :].T
 
-            # 根据雷达投影到多个相机上获取雷达点的rgb和语义label
-            labels = []
-            masks = []
-            final_rgb = np.zeros((point_num, 3), dtype=np.float32)
-            front_rgb = None
-            front_mask = None
-            NAN_FLAG_NUM = 255
-            for cam in all_cam_names:
-                cam_time = all_cam_times[cam]
-                idx = np.argmin(np.abs(cam_time - lidar_time))
-                token = all_cam_tokens[cam][idx]
+                # 根据雷达投影到多个相机上获取雷达点的rgb和语义label
+                labels = []
+                masks = []
+                final_rgb = np.zeros((point_num, 3), dtype=np.float32)
+                front_rgb = None
+                front_mask = None
+                NAN_FLAG_NUM = 255
+                for cam in all_cam_names:
+                    cam_time = all_cam_times[cam]
+                    idx = np.argmin(np.abs(cam_time - lidar_time))
+                    token = all_cam_tokens[cam][idx]
 
-                uv, depths, image, mask = worldpoint2camera(nusc, lidar, token)  # (2, M), (M,), (H, W, 3), (N,) sum(mask) = M
-                rel_camera_path = nusc.get("sample_data", token)["filename"]
-                rel_label_path = rel_camera_path.replace("/CAM", "/seg_CAM")
-                rel_label_path = rel_label_path.replace(".jpg", ".png")
-                label_path = os.path.join(seg_root, rel_label_path)
-                if not os.path.exists(label_path):
-                    raise FileNotFoundError(f"label_path {label_path} not exists!")
-                label_image = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)  # (H, W)
-                road_mask, cam_label = label2mask(label_image)  # (H, W), (H, W)
+                    uv, depths, image, mask = worldpoint2camera(nusc, lidar, token)  # (2, M), (M,), (H, W, 3), (N,) sum(mask) = M
+                    rel_camera_path = nusc.get("sample_data", token)["filename"]
+                    rel_label_path = rel_camera_path.replace("/CAM", "/seg_CAM")
+                    rel_label_path = rel_label_path.replace(".jpg", ".png")
+                    label_path = os.path.join(seg_root, rel_label_path)
+                    if not os.path.exists(label_path):
+                        raise FileNotFoundError(f"label_path {label_path} not exists!")
+                    label_image = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)  # (H, W)
+                    road_mask, cam_label = label_mapping.label2mask(label_image)  # (H, W), (H, W)
 
-                remap_cam_label = remap_semantic(cam_label).astype(np.uint8)
-                render_label = render_semantic(remap_cam_label)
+                    remap_cam_label = label_mapping.remap_semantic(cam_label).astype(np.uint8)
+                    render_label = render_semantic(remap_cam_label, label_mapping.color_map)
 
-                valid_rgb = image[uv[1], uv[0]][:, ::-1] / 255.0
-                valid_label = cam_label[uv[1], uv[0]]
+                    valid_rgb = image[uv[1], uv[0]][:, ::-1] / 255.0
+                    valid_label = cam_label[uv[1], uv[0]]
 
-                road_point_mask = road_mask[uv[1], uv[0]] == 1  # (M,)
-                tmp_mask = np.zeros((point_num,), dtype=bool)
-                tmp_mask[mask] = road_point_mask
-                mask = tmp_mask
+                    road_point_mask = road_mask[uv[1], uv[0]] == 1  # (M,)
+                    tmp_mask = np.zeros((point_num,), dtype=bool)
+                    tmp_mask[mask] = road_point_mask
+                    mask = tmp_mask
 
-                valid_rgb = valid_rgb[road_point_mask]
-                valid_label = valid_label[road_point_mask]
+                    valid_rgb = valid_rgb[road_point_mask]
+                    valid_label = valid_label[road_point_mask]
 
-                final_rgb[mask] = valid_rgb
-                if cam == "CAM_FRONT":
-                    front_rgb = valid_rgb
-                    front_mask = mask
+                    final_rgb[mask] = valid_rgb
+                    if cam == "CAM_FRONT":
+                        front_rgb = valid_rgb
+                        front_mask = mask
 
-                tmp_label = np.ones((point_num,), dtype=np.uint8) * NAN_FLAG_NUM
-                tmp_label[mask] = valid_label
-                labels.append(tmp_label)
-                masks.append(mask)  # (N,) sum(mask) = M_cam
+                    tmp_label = np.ones((point_num,), dtype=np.uint8) * NAN_FLAG_NUM
+                    tmp_label[mask] = valid_label
+                    labels.append(tmp_label)
+                    masks.append(mask)  # (N,) sum(mask) = M_cam
 
-            # 尽量使用前视相机的rgb
-            final_rgb[front_mask] = front_rgb
-            mask = np.stack(masks, axis=-1).any(axis=-1)  # (point_num,)
-            final_rgb = final_rgb[mask]
-            final_point = current_point[mask]
-            final_label = np.stack(labels, axis=-1)  # (point_num, cam_num)
-            final_label = final_label[mask]  # (M, cam_num)
+                # 尽量使用前视相机的rgb
+                final_rgb[front_mask] = front_rgb
+                mask = np.stack(masks, axis=-1).any(axis=-1)  # (point_num,)
+                final_rgb = final_rgb[mask]
+                final_point = current_point[mask]
+                final_label = np.stack(labels, axis=-1)  # (point_num, cam_num)
+                final_label = final_label[mask]  # (M, cam_num)
 
-            final_label = np.apply_along_axis(lambda x: np.bincount(x[x != NAN_FLAG_NUM]).argmax(), axis=1, arr=final_label)  # (point_num,)
-            final_cam_label = remap_semantic(final_label).astype(np.uint8)
-            final_render_label = render_semantic(final_cam_label).squeeze(1) / 255.0
+                final_label = np.apply_along_axis(lambda x: np.bincount(x[x != NAN_FLAG_NUM]).argmax(), axis=1, arr=final_label)  # (point_num,)
+                final_cam_label = label_mapping.remap_semantic(final_label).astype(np.uint8)
+                final_render_label = render_semantic(final_cam_label, label_mapping.color_map).squeeze(1) / 255.0
 
-            all_labels_points.setdefault("point", []).append(final_point)
-            all_labels_points.setdefault("label", []).append(final_label[:, None])
-            all_labels_points.setdefault("rgb", []).append(final_rgb)
-            all_labels_points.setdefault("label_rgb", []).append(final_render_label)
+                all_labels_points.setdefault("point", []).append(final_point)
+                all_labels_points.setdefault("label", []).append(final_label[:, None])
+                all_labels_points.setdefault("rgb", []).append(final_rgb)
+                all_labels_points.setdefault("label_rgb", []).append(final_render_label)
+        except FileNotFoundError as e:
+            print(f"scene {scene_name} not processed because of {e}")
+            if args.skip_missing_labels:
+                continue
+            else:
+                raise e
 
         xyz = np.concatenate(all_labels_points["point"], axis=0)  # (n, 3)
         label = np.concatenate(all_labels_points["label"], axis=0)  # (n, 1)
@@ -330,5 +371,5 @@ if __name__ == "__main__":
 
             for cam_name in all_cam_names:
                 print(f"processing {cam_name} depth ...")
-                generate_cam_depth(nusc, cam_name, all_lidars, lidar_times, depth_save_root, seg_root, use_all_frame=use_all_frame,
+                generate_cam_depth(nusc, cam_name, all_lidars, lidar_times, depth_save_root, seg_root, label_mapping, use_all_frame=use_all_frame,
                                 lidar_frame_range=lidar_frame_range, vis=False)

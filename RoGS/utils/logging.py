@@ -1,4 +1,13 @@
 # -- coding: utf-8 --
+
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from RoGS (a214497)
+#   (https://github.com/fzhiheng/RoGS/tree/a21449733c157ca2d58adfc3b8c2225a624ee466)
+# Copyright 2024 Zhiheng Feng, licensed under the Apache-2.0 license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import time
 import datetime
 import logging
@@ -11,7 +20,7 @@ import torch.distributed as dist
 
 logger_initialized = {}
 
-def create_logger(name, log_file=None, log_level=logging.INFO, use_beijing_time=True):
+def create_logger(name, log_file=None, log_level=logging.INFO, use_beijing_time=False):
 
     logger = logging.getLogger(name)
     # if name in logger_initialized:
@@ -57,3 +66,14 @@ def create_logger(name, log_file=None, log_level=logging.INFO, use_beijing_time=
     logger_initialized[name] = True
 
     return logger
+
+class DummyLogger:
+    """Dummy logger to suppress logging messages."""
+    def info(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
+        pass

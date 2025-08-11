@@ -1,7 +1,16 @@
+# Copyright (c) 2025 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from RoGS (a214497)
+#   (https://github.com/fzhiheng/RoGS/tree/a21449733c157ca2d58adfc3b8c2225a624ee466)
+# Copyright 2024 Zhiheng Feng, licensed under the Apache-2.0 license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import os
 import datetime
 import random
 import argparse
+import math
 
 GUI_FLAG = False
 try:
@@ -25,7 +34,7 @@ from pytorch3d.structures import Pointclouds
 from torch.utils.data import DataLoader
 from diff_gaussian_rasterization.scene.cameras import PerspectiveCamera
 
-from utils.logging import create_logger
+from utils.logging import create_logger, DummyLogger
 from utils.image import render_semantic
 from utils.render import render, render_label
 from utils.visualizer import loss2color, depth2color, CustomPointVisualizer
@@ -34,6 +43,9 @@ from models.loss import L1MaskedLoss, CELossWithMask
 from models.exposure_model import ExposureModel
 from models.gaussian_model import GaussianModel2D
 from eval import eval_bev_metric, eval_z_metric
+from datasets.base import get_dataset_cls
+
+from post_process import MASK_CLASS
 
 
 def set_randomness(seed):
@@ -55,37 +67,38 @@ def get_configs():
 
 
 def gt_render(dataset, min_xy, max_xy, bev_cam_height, wh=None, resolution=None, save_root=None, device="cuda:0"):
-    gt_bev_visualizer = CustomPointVisualizer(device, min_xy, max_xy, bev_cam_height, wh=wh, resolution=resolution)
     road_pointcloud = dataset.road_pointcloud
     for key, value in road_pointcloud.items():
         road_pointcloud[key] = torch.from_numpy(value.astype(np.float32)).to(device)
-    features = torch.cat((road_pointcloud["rgb"], road_pointcloud["label"]), dim=1)
-    pointclouds = Pointclouds(points=[road_pointcloud["xyz"]], features=[features])
-    pointclouds.extend(1)
 
-    point_feature, depth = gt_bev_visualizer(pointclouds)
-    point_feature = point_feature[0].detach().cpu().numpy()
+    if save_root is not None:
+        features = torch.cat((road_pointcloud["rgb"], road_pointcloud["label"]), dim=1)
+        pointclouds = Pointclouds(points=[road_pointcloud["xyz"]], features=[features])
+        pointclouds.extend(1)
+        gt_bev_visualizer = CustomPointVisualizer(device, min_xy, max_xy, bev_cam_height, wh=wh, resolution=resolution)
+        point_feature, depth = gt_bev_visualizer(pointclouds)
+        point_feature = point_feature[0].detach().cpu().numpy()
 
-    point_rgb = point_feature[..., :3]  # (H,W,3)
-    bev_gt_label = dataset.remap_semantic(point_feature[..., -2])  # (H,W)
-    bev_point_mask = point_feature[..., -1] > 0  # (H,W)
-    point_height = bev_cam_height - depth[0, :, :, 0]  # (H,W)
-    point_height = point_height.detach().cpu().numpy()  # (H,W)
+        point_rgb = point_feature[..., :3]  # (H,W,3)
+        bev_gt_label = dataset.remap_semantic(point_feature[..., -2])  # (H,W)
+        bev_point_mask = point_feature[..., -1] > 0  # (H,W)
+        point_height = bev_cam_height - depth[0, :, :, 0]  # (H,W)
+        point_height = point_height.detach().cpu().numpy()  # (H,W)
 
-    os.makedirs(save_root, exist_ok=True)
-    np.save(os.path.join(save_root, f"bev_height.npy"), point_height)
+        os.makedirs(save_root, exist_ok=True)
+        np.save(os.path.join(save_root, f"bev_height.npy"), point_height)
 
-    point_rgb[~bev_point_mask] = [0, 0, 0]
-    vis_bev_gt_seg = render_semantic(bev_gt_label, dataset.filted_color_map)
-    vis_bev_gt_seg[~bev_point_mask] = [0, 0, 0]
-    cv2.imwrite(os.path.join(save_root, "bev_image.png"), cv2.cvtColor((point_rgb * 225).astype(np.uint8), cv2.COLOR_RGB2BGR))
-    cv2.imwrite(os.path.join(save_root, "bev_label.png"), bev_gt_label)
-    cv2.imwrite(os.path.join(save_root, "bev_mask.png"), bev_point_mask.astype(np.uint8) * 255)
-    cv2.imwrite(os.path.join(save_root, "bev_label_vis.png"), cv2.cvtColor(vis_bev_gt_seg, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(os.path.join(save_root, "bev_height_vis.png"), cv2.cvtColor(depth2color(point_height, bev_point_mask), cv2.COLOR_RGB2BGR))
+        point_rgb[~bev_point_mask] = [0, 0, 0]
+        vis_bev_gt_seg = render_semantic(bev_gt_label, dataset.filted_color_map)
+        vis_bev_gt_seg[~bev_point_mask] = [0, 0, 0]
+        cv2.imwrite(os.path.join(save_root, "bev_image.png"), cv2.cvtColor((point_rgb * 225).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(save_root, "bev_label.png"), bev_gt_label)
+        cv2.imwrite(os.path.join(save_root, "bev_mask.png"), bev_point_mask.astype(np.uint8) * 255)
+        cv2.imwrite(os.path.join(save_root, "bev_label_vis.png"), cv2.cvtColor(vis_bev_gt_seg, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(save_root, "bev_height_vis.png"), cv2.cvtColor(depth2color(point_height, bev_point_mask), cv2.COLOR_RGB2BGR))
 
 
-def train(configs):
+def train(configs, dataset_kwargs={}):
     dataset_cfg = configs.dataset
     model_cfg = configs.model
     pipe = configs.pipeline
@@ -101,27 +114,25 @@ def train(configs):
         output_root += "-z"
     else:
         output_root += "-no_z"
-    os.makedirs(output_root, exist_ok=True)
-    logger = create_logger(f"RoGS", os.path.join(output_root, "train.log"))
+    if train_cfg.log or train_cfg.store_artifacts or train_cfg.output_render or train_cfg.store_cfg:
+        os.makedirs(output_root, exist_ok=True)
+    logger = create_logger(f"RoGS", os.path.join(output_root, "train.log")) if train_cfg.log else DummyLogger()
     img_root = os.path.join(output_root, "images")
-    ply_root = os.path.join(output_root, "ply")
 
     # backup
-    os.system(f"cp {configs.file} {output_root}")
+    if train_cfg.store_cfg:
+        os.system(f"cp {configs.file} {output_root}")
 
     device = torch.device(configs["device"] if torch.cuda.is_available() else "cpu")
-    if dataset_cfg["dataset"] == "NuscDataset":
-        from datasets.nusc import NuscDataset as Dataset
-    elif dataset_cfg["dataset"] == "KittiDataset":
-        from datasets.kitti import KittiDataset as Dataset
-    else:
-        raise NotImplementedError("Dataset not implemented")
+    Dataset = get_dataset_cls(dataset_cfg["dataset"])
 
-    dataset = Dataset(dataset_cfg, use_label=opt.seg_loss_weight > 0, use_depth=opt.depth_loss_weight > 0)
+    use_lidar = opt.depth_loss_weight > 0 or opt.z_weight > 0
+    dataset = Dataset(dataset_cfg, use_label=opt.seg_loss_weight > 0,
+        use_depth=opt.depth_loss_weight > 0, use_lidar=use_lidar, **dataset_kwargs)
     logger.info(f"Dataset cameras_extent: {dataset.cameras_extent} - size: {len(dataset)}")
     road = Road(model_cfg, dataset, device=device, vis=train_cfg.vis and GUI_FLAG)
     gaussians = GaussianModel2D(model_cfg)
-    gaussians.init_2d_gaussian(road.vertices, road.rotation, road.rgb, road.label, road.resolution, road.ref_pose, dataset.cameras_extent)
+    gaussians.init_2d_gaussian(road.vertices, road.rotation, road.rgb, road.label, road.resolution, dataset.ref_pose, dataset.cameras_extent)
     opt["position_lr_max_steps"] = len(dataset) * opt.epochs
     gaussians.training_setup(opt)
 
@@ -130,7 +141,7 @@ def train(configs):
 
     road_pointcloud = dataset.road_pointcloud
     if road_pointcloud is not None:
-        road_point_root = os.path.join(output_root, "road_point")
+        road_point_root = os.path.join(output_root, "road_point") if train_cfg.store_artifacts else None
         gt_render(dataset, road.min_xy, road.max_xy, bev_cam_height, wh=(bev_cam.image_width, bev_cam.image_height), save_root=road_point_root, device=device)
 
     exposure_model = ExposureModel(num_camera=len(dataset.camera_names)).to(device)
@@ -199,6 +210,8 @@ def train(configs):
             viewpoint_cam = PerspectiveCamera(R, T, sample["K"], sample["W"], sample["H"], NEAR, FAR, device)
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
+            bg_label = torch.zeros(dataset.num_class, dtype=torch.float32, device=bg.device) # 6 classes
+            bg_label[MASK_CLASS] = 1
 
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
             src_render_image, render_depth, render_mask = render_pkg["render"], render_pkg["depth"][0], render_pkg["mask"]
@@ -206,9 +219,6 @@ def train(configs):
             hit_num = torch.sum(visibility_filter)
             render_image = exposure_model(cam_idx, src_render_image)
             render_image = render_image.permute(1, 2, 0)
-            src_render_image = src_render_image.permute(1, 2, 0)  # (H, W, 3)
-            src_render_image = src_render_image.detach().cpu().numpy() * 255
-            src_render_image = cv2.cvtColor(src_render_image.astype(np.uint8), cv2.COLOR_RGB2BGR)
 
             valid_mask = torch.bitwise_and(render_depth.detach() > viewpoint_cam.znear, render_depth.detach() < viewpoint_cam.zfar)
             loss_mask = valid_mask.float()
@@ -282,7 +292,7 @@ def train(configs):
                     progress_bar.close()
             iteration += 1
 
-        if True:
+        if train_cfg.output_render: # Visualization
             current_root = os.path.join(img_root, f"EPOCH-{epoch}_IDX-{image_idx}", f"{image_name}")
             if epoch == opt.epochs - 1:
                 final_root = os.path.join(img_root, "final")
@@ -319,6 +329,9 @@ def train(configs):
             cv2.imwrite(os.path.join(current_root, f"gt_label.png"), gt_label)
             cv2.imwrite(os.path.join(current_root, f"gt_blend.png"), gt_blend)
 
+            src_render_image = src_render_image.permute(1, 2, 0)  # (H, W, 3)
+            src_render_image = src_render_image.detach().cpu().numpy() * 255
+            src_render_image = cv2.cvtColor(src_render_image.astype(np.uint8), cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(current_root, f"render_src_image.png"), src_render_image)
             cv2.imwrite(os.path.join(current_root, f"render_image.png"), render_image)
             cv2.imwrite(os.path.join(current_root, f"render_label_vis.png"), vis_render_seg)
@@ -362,37 +375,10 @@ def train(configs):
             vis_bev_height = depth2color(bev_height, mask=bev_mask)
             vis_bev_height = cv2.cvtColor(vis_bev_height, cv2.COLOR_RGB2BGRA)
 
-            label_feature = render_label(bev_cam, gaussians, pipe, bg)
-            bev_label = label_feature["render"].permute(1, 2, 0)  # (H, W, C)
-            bev_label = np.argmax(bev_label.detach().cpu().numpy(), axis=-1)  # (H, W)
-            vis_bev_label = render_semantic(bev_label, dataset.filted_color_map)
-            vis_bev_label = cv2.cvtColor(vis_bev_label, cv2.COLOR_RGB2BGRA)
-            vis_bev_label[~bev_mask] = 0
-
-            cv2.imwrite(os.path.join(current_root, f"bev_scr_image.png"), src_bev_image)
-            cv2.imwrite(os.path.join(current_root, f"bev_mask.png"), bev_mask * 255)
-            cv2.imwrite(os.path.join(current_root, f"bev_image.png"), bev_image)
-            cv2.imwrite(os.path.join(current_root, f"bev_label.png"), bev_label)
-            cv2.imwrite(os.path.join(current_root, f"bev_label_vis.png"), vis_bev_label)
-            cv2.imwrite(os.path.join(current_root, f"bev_height_vis.png"), vis_bev_height)
-
-        if epoch == opt.epochs - 1:
-            os.makedirs(ply_root, exist_ok=True)
-            gaussians.save_ply(os.path.join(ply_root, f"EPOCH-{epoch}-final.ply"))
 
     logger.info(f"Opt has end! It cost time: {cost_time / 1000} s")
-    ckpt_path = os.path.join(output_root, "final.pth")
-    torch.save(gaussians.capture(), ckpt_path)
 
-    if train_cfg.eval:
-        if road_pointcloud is not None:
-            logger.info(f"Just start eval .....")
-            bev_metric = eval_bev_metric(road_point_root, current_root, dataset.num_class)
-            for k, v in bev_metric.items():
-                logger.info(f"[epoch{epoch}] - bev {k}: {v}")
-
-            z_metric = eval_z_metric(road_pointcloud["xyz"], gaussians.get_xyz)
-            logger.info(f"[epoch{epoch}] - z_metric: {z_metric}")
+    return gaussians, exposure_model, dataset, road
 
 
 if __name__ == "__main__":

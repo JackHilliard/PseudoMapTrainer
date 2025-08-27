@@ -16,12 +16,14 @@
 <h3 align="center">ICCV 2025</h3>
 <p align="center">
     <!-- doc badges -->
-    <a href="http://arxiv.org/abs/xxxx.xxxx">
+    <a href="http://arxiv.org/abs/2508.18788">
         <img src='https://img.shields.io/badge/arXiv-Paper-aff'>
     </a>
 </p>
 
 # 
+
+https://github.com/user-attachments/assets/6102ff1c-27ce-423c-a07d-c5a88a584c64
 
 
 

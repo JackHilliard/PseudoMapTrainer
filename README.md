@@ -42,6 +42,24 @@ This software is a research prototype, developed solely for and published as par
 
 This codebase primarily consists of three repositories: Mask2Former (see 1.1), RoGS (1.2), and MapVR (2), each adapted specifically for PseudoMapTrainer. Each repository has its own Python environment, described in detail below. Please follow these steps to generate pseudo-labels and train the online mapping model.
 
+#### Docker (optional, required for H100/Hopper GPUs)
+
+The [`Dockerfile`](./Dockerfile) builds all three environments into one image as three conda envs (`base` = MapVR, `rogs`, `mask2former`), on CUDA 11.8 / PyTorch 2.1. The versions pinned in the sections below (CUDA 11.1/11.3/11.6) predate Hopper's `sm_90` entirely and cannot run on an H100; the image bumps all three onto the first CUDA release that supports it.
+
+```sh
+docker build -t pseudomaptrainer .
+docker run --gpus all --shm-size=16g -it \
+  -v /path/to/nuscenes:/data/nuscenes \
+  -v /path/to/outputs:/workspace/PseudoMapTrainer/RoGS/output \
+  pseudomaptrainer
+
+# inside the container
+conda activate rogs          # RoGS stage; `conda activate mask2former` for PV segmentation
+                             # the default (base) env is the MapVR training env
+```
+
+Datasets, pseudo-labels and checkpoints are mounted, not baked in — set the config paths (`base_dir`, `label_dir`, `output`, `data_root_seg`, …) to the mount points.
+
 ### 1) Generation of pseudo-labels
 
 #### 1.1) Get PV segmentation labels ([`Mask2Former`](./Mask2Former/))

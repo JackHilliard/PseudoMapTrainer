@@ -24,8 +24,11 @@ class GeometricKernelAttentionFunc(Function):
     @once_differentiable
     def backward(ctx, grad_output):
         value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
+        # torch>=2.x's autograd no longer guarantees grad_output is contiguous
+        # here (torch 1.9 always handed this kernel a contiguous tensor); the
+        # CUDA kernel asserts contiguity and throws otherwise.
         grad_value, grad_attn_weight = \
             GKA.geometric_kernel_attn_cuda_backward(
-                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output, ctx.im2col_step)
+                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output.contiguous(), ctx.im2col_step)
 
         return grad_value, None, None, None, grad_attn_weight, None

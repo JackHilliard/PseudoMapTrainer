@@ -1,8 +1,15 @@
 lyft_dataset_sdk
-networkx>=2.2,<2.3
-# we may unlock the verion of numba in the future
-numba==0.48.0
-#numpy<1.20.0
+# networkx<2.3 still does `from collections import Mapping`, removed in
+# Python 3.10; 2.8.8 is the last 2.x release, staying closer to this
+# codebase's expected API than jumping to networkx 3.x.
+networkx==2.8.8
+# numba==0.48.0 predates Python 3.10 support entirely (no matching wheel);
+# 0.57.1 is the oldest release with official Python 3.10 support.
+numba==0.57.1
+# No upper pin here: whatever resolves is overridden by the explicit
+# numpy==1.23.5 pin later in the Dockerfile anyway, and the old
+# numpy<1.20.0 pin has no prebuilt wheel for Python 3.10.
+numpy
 nuscenes-devkit
 plyfile
 scikit-image

@@ -23,10 +23,15 @@ def get_extensions():
 
     sources = main_file
     extension = CppExtension
-    extra_compile_args = {"cxx": []}
+    # ATen headers require C++17 as of torch 2.x, which the Dockerfile now
+    # targets for Hopper (sm_90) support.
+    extra_compile_args = {"cxx": ["-std=c++17"]}
     define_macros = []
 
-    if torch.cuda.is_available() and CUDA_HOME is not None:
+    # FORCE_CUDA lets this build in a container with the CUDA toolkit but no
+    # visible GPU (docker build has no --gpus), same as mmdetection3d's own
+    # setup.py already does.
+    if (torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1") and CUDA_HOME is not None:
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
@@ -35,6 +40,7 @@ def get_extensions():
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
+            "-std=c++17",
         ]
     else:
         raise NotImplementedError('Cuda is not availabel')

@@ -1,0 +1,13 @@
+.git
+.claude
+**/__pycache__
+**/*.egg-info
+**/build/
+# Datasets, labels, checkpoints and training output are mounted at runtime,
+# never baked into the image.
+MapVR/data
+MapVR/ckpts
+MapVR/work_dirs
+RoGS/output
+RoGS/data
+Mask2Former/output

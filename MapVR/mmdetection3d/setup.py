@@ -39,7 +39,10 @@ def make_cuda_ext(name,
                   extra_include_path=[]):
 
     define_macros = []
-    extra_compile_args = {'cxx': [] + extra_args}
+    # ATen headers require C++17 as of the newer torch this image now
+    # targets; appended after extra_args so it overrides call sites (e.g.
+    # spconv) that still hardcode an older -std=c++14.
+    extra_compile_args = {'cxx': [] + extra_args + ['-std=c++17']}
 
     if torch.cuda.is_available() or os.getenv('FORCE_CUDA', '0') == '1':
         define_macros += [('WITH_CUDA', None)]
@@ -48,6 +51,7 @@ def make_cuda_ext(name,
             '-D__CUDA_NO_HALF_OPERATORS__',
             '-D__CUDA_NO_HALF_CONVERSIONS__',
             '-D__CUDA_NO_HALF2_OPERATORS__',
+            '-std=c++17',
         ]
         sources += sources_cuda
     else:

@@ -21,7 +21,9 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include <THC/THCAtomics.cuh>
+// THC/THCAtomics.cuh was removed from PyTorch in 1.11; ATen/cuda/Atomic.cuh
+// is its in-tree successor (same gpuAtomicAdd overloads).
+#include <ATen/cuda/Atomic.cuh>
 
 #define CUDA_KERNEL_LOOP(i, n)                          \
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;   \

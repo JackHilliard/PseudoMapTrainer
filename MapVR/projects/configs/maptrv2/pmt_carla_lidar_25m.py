@@ -8,9 +8,24 @@
 
 #
 # PseudoMapTrainer on the CARLA road-polyline tile dataset, LiDAR only.
-# Tile size: 30 x 30 m. For the 25 x 25 m example export, use
-# pmt_carla_lidar_25m.py, which is this config with the five tile-size-derived
-# values changed.
+# Tile size: 25 x 25 m -- the example export, for testing the pipeline
+# end to end. pmt_carla_lidar.py is the same config at 30 x 30 m.
+#
+# Everything except the tile geometry is identical to pmt_carla_lidar.py; it
+# is a full copy rather than a `_base_` override because the tile size is
+# baked into the pipeline lists too, and mmcv resolves data.*.pipeline against
+# the *base's* train_pipeline/test_pipeline objects -- redefining those in a
+# derived config would silently leave the pipelines on the parent's geometry.
+#
+# The five tile-size-derived values, and nothing else, differ:
+#   point_cloud_range xy       +/-12.5   (vs +/-15.0)
+#   lidar_point_cloud_range xy +/-12.5   (vs +/-15.0)
+#   sparse_shape x, y          251       (vs 301)
+#   post_center_range          +/-17.5   (vs +/-20.0)
+#   data_root                  data/carla_25m/
+# bev_h_/bev_w_ and renderer_H/W deliberately stay at 100 and 128, so the cell
+# size is finer here (0.25 and 0.195 m) rather than the layout changing.
+# lidar_bev_proj.in_channels stays 3712: only the z range moves that.
 #
 # This is pmt_single.py with the camera swapped out for LiDAR. The LiDAR path
 # is the one proven in the sibling MapTRv2/GeMap codebases
@@ -34,8 +49,7 @@
 #     otherwise call transformer.encoder.get_depth_loss on a None encoder)
 #   * aux_seg pv_seg=False -- there is no imagery to rasterize into
 #   * one map class ('divider') instead of three
-#   * square 100x100 BEV over the square 30 x 30 m tile (0.3 m/cell, the same
-#     BEV resolution pmt_single.py uses on nuScenes)
+#   * square 100x100 BEV over the square 25 x 25 m tile
 #
 # carlasim_map.py already pulls in ../_base_/default_runtime.py; listing it
 # here as well makes mmcv reject the config for duplicate base keys.
@@ -45,15 +59,9 @@ _base_ = [
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
-# Map / coder range: the square CARLA tile (30 x 30 m, tile_radius 15). GT
-# polylines are XY-only, so the z half only has to contain them.
-#
-# Tile size is the one thing to change for a differently-sized export, and it
-# touches five values: this range's xy, lidar_point_cloud_range's xy,
-# sparse_shape's x/y, post_center_range, and (if you want to hold the cell
-# size) bev_h_/bev_w_ and renderer_H/W. pmt_carla_lidar_25m.py is the same
-# config with all of them set for a 25 x 25 m export.
-point_cloud_range = [-15.0, -15.0, -30.0, 15.0, 15.0, 20.0]
+# Map / coder range: the square CARLA tile (tile_radius 12.5). GT polylines
+# are XY-only, so the z half only has to contain them.
+point_cloud_range = [-12.5, -12.5, -30.0, 12.5, 12.5, 20.0]
 voxel_size = [0.15, 0.15, 20.0]
 
 # LiDAR branch geometry, deliberately separate from the map range above.
@@ -61,15 +69,12 @@ voxel_size = [0.15, 0.15, 20.0]
 # The z half is wide because this pipeline does NO z filtering anywhere:
 # LoadCarlaPointsFromFile drops the upstream z_max clamp, so this range is
 # the only thing that could discard a point on the z axis. Measured exactly
-# over all 4103 train + 259 test tiles of the 25 m reference export, z spans
-# [-97.09, +91.43] -- a tile is only tens of metres across but can contain a
-# highway overpass, so it spans 100+ m vertically. [-98, 92] contains all of
-# it. For reference, the upstream CARLA configs' [-72, 96] would clip 2.4% of
-# those tiles. This z half is carried over unmeasured to the 30 m export:
-# re-measure it (min/max of features[:, 2] over every tile) before a real run,
-# since with no z filtering anywhere this range is the only thing that can
-# drop a point on the z axis.
-lidar_point_cloud_range = [-15.0, -15.0, -98.0, 15.0, 15.0, 92.0]
+# over all 4103 train + 259 test tiles of the reference export, z spans
+# [-97.09, +91.43] -- tiles are 25 x 25 m but can contain a highway overpass,
+# so a single tile spans 100+ m vertically. [-98, 92] contains all of it.
+# For reference, the upstream CARLA configs' [-72, 96] would clip 2.4% of
+# train tiles. Re-measure for a different export before changing this.
+lidar_point_cloud_range = [-12.5, -12.5, -98.0, 12.5, 12.5, 92.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 
 map_classes = ['divider']
@@ -81,9 +86,8 @@ num_map_classes = len(map_classes)
 
 # Rasterization canvas for RenderedMaskDiceLoss and for the BEV mask, which
 # must be exactly (renderer_H, renderer_W) -- the loss reshapes the mask to
-# renderer_H * renderer_W. Square, matching the square tile; over 30 m, 128
-# gives 0.234 m/cell, the same rendering resolution pmt_single.py uses on
-# nuScenes (256 x 128 over 60 x 30 m).
+# renderer_H * renderer_W. Square, matching the square tile; 128 gives
+# ~0.195 m/cell, close to pmt_single.py's ~0.23 m/cell on nuScenes.
 renderer_H = 128
 renderer_W = 128
 
@@ -100,8 +104,7 @@ _ffn_dim_ = _dim_*2
 _num_levels_ = 1
 # Square BEV for a square tile. pmt_single.py's 200x100 mirrors nuScenes'
 # 30 x 60 m patch; using it here would give non-square cells and mismatch the
-# dataset's own gt_seg_mask canvas. Over 30 m, 100 x 100 is 0.3 m/cell --
-# exactly pmt_single.py's BEV resolution on nuScenes.
+# dataset's own gt_seg_mask canvas.
 bev_h_ = 100
 bev_w_ = 100
 queue_length = 1  # each sequence contains `queue_length` frames.
@@ -122,9 +125,10 @@ model = dict(
     modality='lidar',
     # LiDAR BEV encoder. SparseEncoder returns a dense (B, C*D, H, W) tensor,
     # so no pooling/LSS step is needed -- the transformer only channel-projects
-    # it. sparse_shape is (x, y, z+1) for the range/voxel size above: 301 =
-    # 30 m / 0.1 + 1. Measured, not derived (verified: the largest voxel index
-    # a real tile produces is 299/299/474, inside these bounds).
+    # it. sparse_shape is (x, y, z+1) for the range/voxel size above; both it
+    # and lidar_bev_proj.in_channels were measured with a real
+    # extract_lidar_feat() call rather than hand-derived, because the z
+    # downsample factor is not linear in the input z extent.
     lidar_encoder=dict(
         voxelize=dict(
             max_num_points=10,
@@ -134,7 +138,7 @@ model = dict(
         backbone=dict(
             type='SparseEncoder',
             in_channels=4,          # x, y, z, strength (BT.709 luma of rgb)
-            sparse_shape=[301, 301, 476],
+            sparse_shape=[251, 251, 476],
             output_channels=128,
             order=('conv', 'norm', 'act'),
             encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
@@ -174,12 +178,10 @@ model = dict(
             modality='lidar',
             # 3712 = SparseEncoder output_channels (128) x its residual z
             # depth (29), measured with a real extract_lidar_feat() call:
-            # lidar_feat comes out (B, 3712, 38, 38) at this tile size. Only
-            # the z half of lidar_point_cloud_range moves this number -- tile
-            # size changes the spatial dims (32x32 at 25 m, 38x38 at 30 m) but
-            # not the channel count. Do not derive it by hand: the z
-            # downsample factor is not linear in the input extent (naively it
-            # looks like 3584). MEASURE it again if the LiDAR z range or voxel
+            # lidar_feat comes out (B, 3712, 32, 32) for the range and voxel
+            # size above. Do not try to derive this by hand -- the z
+            # downsample factor is not linear in the input z extent (naively
+            # it looks like 28). MEASURE it again if the LiDAR range or voxel
             # size changes; a wrong value fails loudly as a Conv2d mismatch.
             lidar_bev_proj=dict(
                 type='ConvFuser',
@@ -221,7 +223,7 @@ model = dict(
             type='MapTRNMSFreeCoder',
             # Tile-sized, mirroring pmt_single.py's relationship to its own
             # point_cloud_range.
-            post_center_range=[-20.0, -20.0, -20.0, -20.0, 20.0, 20.0, 20.0, 20.0],
+            post_center_range=[-17.5, -17.5, -17.5, -17.5, 17.5, 17.5, 17.5, 17.5],
             pc_range=point_cloud_range,
             max_num=50,
             voxel_size=voxel_size,
@@ -268,8 +270,11 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'PMTCarlaMapDataset'
-data_root = 'data/carla/'
-raw_data_root = 'data/carla/'
+# Separate root from the 30 m export so the two cannot be mixed up: the pkls
+# record the range they were converted against, and the dataset warns when it
+# does not match the config's.
+data_root = 'data/carla_25m/'
+raw_data_root = 'data/carla_25m/'
 
 # GridSamplePoints is not optional here: 18 train tiles hit the converter's
 # 5,000,000-point ceiling (median is ~115k), and at that scale mmdet3d's

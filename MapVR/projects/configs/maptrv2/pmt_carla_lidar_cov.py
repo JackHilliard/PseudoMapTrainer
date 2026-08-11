@@ -18,6 +18,10 @@
 # large close_kernel fills real gaps back in and makes the mask a no-op.
 # Dump a few masks and look at them before trusting any numbers.
 #
+# Inherits the 30 x 30 m geometry. For the same thing on the 25 x 25 m export,
+# there is no second file: add
+#   --cfg-options data.train.mask_mode=lidar_coverage data.train.mask_thresh=0.3
+# to a pmt_carla_lidar_25m.py run.
 _base_ = ['./pmt_carla_lidar.py']
 
 data = dict(

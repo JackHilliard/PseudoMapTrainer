@@ -39,10 +39,16 @@ ann_file_val = data_root + 'carla_map_infos_test.pkl'
 ann_file_test = data_root + 'carla_map_infos_test.pkl'
 map_ann_file = data_root + 'carla_map_gt.json'
 
-# Matches the square CARLA tile (tile_radius=12.5 -> 25m x 25m). The z half
+# Matches the square CARLA tile (tile_radius=15 -> 30m x 30m). The z half
 # only needs to contain the map GT, which is XY-only here; the LiDAR branch
 # has its own, much wider `lidar_point_cloud_range` (see pmt_carla_lidar.py).
-point_cloud_range = [-12.5, -12.5, -30.0, 12.5, 12.5, 20.0]
+#
+# This is only a default: every trainable config sets its own geometry, so
+# changing tile size means editing that config (pmt_carla_lidar.py for
+# 30 x 30 m, pmt_carla_lidar_25m.py for 25 x 25 m), not this file. The
+# converter derives its own xy range from the manifest's tile_radius and
+# records it in the pkl, so the dataset warns when the two disagree.
+point_cloud_range = [-15.0, -15.0, -30.0, 15.0, 15.0, 20.0]
 map_classes = ['divider']
 
 # LiDAR points are [x, y, z, strength].

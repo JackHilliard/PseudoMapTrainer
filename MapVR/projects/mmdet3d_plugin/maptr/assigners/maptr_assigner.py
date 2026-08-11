@@ -670,7 +670,10 @@ class MaskedMapTRAssigner(MapTRAssigner):
         o2m_idx_map = idx_map[~only_o2o]
         o2m_idx_uni, counts = o2m_idx_map.unique(return_counts=True)    
         max_splits = counts.max().item() if not only_o2o.all() else 1
-        gt_touches_brd_idx_list = list(torch.arange(0, num_gts)[touches_border].numpy())
+        # touches_border lives wherever gt_bev_mask does (CUDA during training),
+        # so the arange has to be created there too rather than on the CPU.
+        gt_touches_brd_idx_list = torch.arange(
+            0, num_gts, device=touches_border.device)[touches_border].tolist()
         num_gt_touch_bor = len(gt_touches_brd_idx_list)
 
         subsets = []
@@ -700,8 +703,13 @@ class MaskedMapTRAssigner(MapTRAssigner):
                     subset_subidx = (touches_border.cumsum(0)-1)[subset]
                     multi_match_cost = masked_cost[idx_mask, subset_subidx[:,None]].detach().cpu()
                     local_row, local_col = linear_sum_assignment(multi_match_cost) # small hungarian matching
-                    local_row, local_col = torch.from_numpy(local_row).to(subset.device), torch.from_numpy(local_col).to(subset.device)
-                    o2m_cost[p,s] = multi_match_cost[local_row, local_col].sum()
+                    # Two copies on purpose: multi_match_cost was moved to the
+                    # CPU for scipy, while the tensors indexed below live on
+                    # the GPU, and an index tensor has to sit on the same
+                    # device as what it indexes.
+                    local_row_cpu, local_col_cpu = torch.from_numpy(local_row), torch.from_numpy(local_col)
+                    local_row, local_col = local_row_cpu.to(subset.device), local_col_cpu.to(subset.device)
+                    o2m_cost[p,s] = multi_match_cost[local_row_cpu, local_col_cpu].sum()
 
                     o2m_order_index[idx_mask.nonzero()[local_row,0],s] = masked_order_index[idx_mask, subset_subidx[:,None]][local_row, local_col]
                     o2m_local_assign_matrix[idx_mask.nonzero()[local_row,0],s] = local_col

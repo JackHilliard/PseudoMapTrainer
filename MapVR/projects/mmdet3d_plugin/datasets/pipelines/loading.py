@@ -457,3 +457,192 @@ class CustomPointToMultiViewDepth(object):
 
         results['gt_depth'] = depth_map
         return results
+
+
+class EmptyLidarTileError(RuntimeError):
+    """A tile has no LiDAR point inside the voxelizer's range.
+
+    Such a tile voxelizes to zero voxels, which crashes
+    ``MapTRv2.extract_lidar_feat``. Raised by ``GridSamplePoints`` so that
+    ``CustomCarlaLocalMapDataset`` can skip the sample instead (train mode
+    only -- see its ``prepare_train_data``). Tiles like this are normally
+    already dropped at conversion time; this exists for annotation files
+    that predate that check.
+    """
+
+
+@PIPELINES.register_module()
+class LoadCarlaPointsFromFile(object):
+    """Load CARLA-simulator LiDAR point clouds from an ``.npz`` block.
+
+    Each ``.npz`` block stores a ``features`` array of shape ``(N, 6)``
+    (xyz + rgb) and a ``labels`` array. Here we only build the LiDAR point
+    cloud: xyz coordinates plus a scalar "strength" derived from the RGB
+    channels (ITU-R BT.709 luma), matching the original
+    ``strength = rgb @ [0.2126, 0.7152, 0.0722]`` formula.
+
+    Unlike the upstream MapTRv2/GeMap version there is deliberately **no
+    ``z_max`` filter**: nothing is dropped on the z axis here. Tiles in this
+    dataset legitimately span roughly z in [-90, +90] m (highway overpasses
+    inside a 25 x 25 m footprint), and the training config's
+    ``lidar_point_cloud_range`` is set wide enough to cover that, so the
+    voxelizer keeps those returns too.
+
+    Args:
+        coord_type (str): Coordinate frame of the points. One of
+            ``'LIDAR'``, ``'DEPTH'``, ``'CAMERA'``. Defaults to ``'LIDAR'``.
+        load_dim (int): Number of columns produced before selection
+            (``x, y, z, strength``). Defaults to 4.
+        use_dim (int | list[int]): Which of those columns to keep. Defaults to
+            4 (all of them).
+    """
+
+    def __init__(self,
+                 coord_type='LIDAR',
+                 load_dim=4,
+                 use_dim=4):
+        if isinstance(use_dim, int):
+            use_dim = list(range(use_dim))
+        assert max(use_dim) < load_dim, \
+            f'Expect all used dimensions < {load_dim}, got {use_dim}'
+        assert coord_type in ['CAMERA', 'LIDAR', 'DEPTH']
+        self.coord_type = coord_type
+        self.load_dim = load_dim
+        self.use_dim = use_dim
+        # ITU-R BT.709 luma weights, as in the original Pointcept dataset.
+        self._rgb2strength = np.array([0.2126, 0.7152, 0.0722],
+                                      dtype=np.float32)
+
+    def _load_points(self, pts_filename):
+        mmcv.check_file_exist(pts_filename)
+        block = np.load(pts_filename)
+        features = block['features']
+        coord = features[:, 0:3].astype(np.float32)
+        strength = (features[:, 3:6].astype(np.float32)
+                    @ self._rgb2strength).reshape([-1, 1])
+        return np.concatenate([coord, strength], axis=1)
+
+    def __call__(self, results):
+        pts_filename = results['pts_filename']
+        points = self._load_points(pts_filename)
+        points = points[:, self.use_dim]
+
+        points_class = get_points_type(self.coord_type)
+        points = points_class(
+            points, points_dim=points.shape[-1], attribute_dims=None)
+        results['points'] = points
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}('
+                f'coord_type={self.coord_type}, '
+                f'load_dim={self.load_dim}, use_dim={self.use_dim})')
+
+
+@PIPELINES.register_module()
+class GridSamplePoints(object):
+    """Pointcept-style grid downsampling: keep one representative point per
+    occupied (grid_size)^3 cell, via integer coordinate packing + a single
+    1D ``torch.unique`` (vectorized, no Python loop over points).
+
+    Some CARLA tiles have raw point counts up to 5,000,000 (a converter
+    artifact -- an unbounded number of scan passes merged into one static
+    block, unlike AV2/nuScenes' hardware-bounded ~10-sweep aggregation).
+    Feeding that directly into the LiDAR voxelizer is both very slow
+    (dominates GPU time end to end) and, confirmed empirically upstream
+    against a known-ground-truth synthetic point cloud, produces genuinely
+    wrong output: mmdet3d's legacy ``Voxelization`` CUDA kernel silently
+    under-reports occupied voxels by ~36% at this scale (2000 known
+    distinct cells, 5,000,000 points -> only 1,280 reported). Grid sampling
+    first collapses the redundant, oversampled raw points to ~1-per-cell
+    *before* voxelization, which is both ~26x faster and recovers 100% of
+    the occupied voxels on the real worst-case tile, vs. only 8.6%-22.4%
+    for naive random subsampling to a similar point budget -- grid sampling
+    is density-uniform, not density-proportional, so it does not
+    disproportionately thin out sparse regions (e.g. divider lines).
+
+    Args:
+        grid_size (float | tuple[float, float, float]): cell size in
+            meters. Defaults to (0.1, 0.1, 0.4), matching this project's
+            LiDAR ``voxel_size`` -- this collapses raw-point redundancy
+            with no *additional* spatial precision loss beyond what the
+            model's own voxelizer already imposes.
+        point_cloud_range (list[float]): must match the range passed to
+            the LiDAR voxelizer downstream (``lidar_point_cloud_range`` in
+            the training config) -- used to bound/offset the integer grid
+            coordinates and to detect tiles with nothing in range, but not
+            to filter points (the voxelizer does that itself).
+        min_points (int): raise ``EmptyLidarTileError`` when fewer than
+            this many points fall inside ``point_cloud_range``, since the
+            voxelizer would then produce zero (or near-zero) voxels and
+            crash ``extract_lidar_feat``. Set to 0 to disable the check.
+            Defaults to 1.
+    """
+
+    def __init__(self,
+                 grid_size=(0.1, 0.1, 0.4),
+                 point_cloud_range=None,
+                 min_points=1):
+        if point_cloud_range is None:
+            raise ValueError('GridSamplePoints requires point_cloud_range '
+                             '(must match the downstream LiDAR voxelizer\'s '
+                             'point_cloud_range).')
+        if isinstance(grid_size, (int, float)):
+            grid_size = (grid_size, grid_size, grid_size)
+        self.grid_size = grid_size
+        self.point_cloud_range = point_cloud_range
+        self.min_points = min_points
+        self.dims = [
+            int(round((point_cloud_range[3 + i] - point_cloud_range[i])
+                      / grid_size[i])) + 1
+            for i in range(3)
+        ]
+
+    def __call__(self, results):
+        points = results['points']
+        tensor = points.tensor
+        xyz = tensor[:, :3]
+        lo = xyz.new_tensor(self.point_cloud_range[:3])
+        hi = xyz.new_tensor(self.point_cloud_range[3:])
+        if tensor.shape[0] == 0:
+            # torch.unique(...).max() below is undefined on an empty tensor,
+            # so bail out before it: nothing to downsample either way.
+            self._check_not_empty(results, 0, 0)
+            return results
+        # Counted before the clamp below, which would otherwise pull
+        # out-of-range points into edge cells and hide the fact that the
+        # voxelizer is about to drop every one of them.
+        n_in_range = int(((xyz >= lo) & (xyz < hi)).all(1).sum())
+        self._check_not_empty(results, tensor.shape[0], n_in_range)
+        gsize = xyz.new_tensor(self.grid_size)
+        gcoord = torch.floor((xyz - lo) / gsize).long()
+        gcoord[:, 0].clamp_(0, self.dims[0] - 1)
+        gcoord[:, 1].clamp_(0, self.dims[1] - 1)
+        gcoord[:, 2].clamp_(0, self.dims[2] - 1)
+        key = (gcoord[:, 0] * self.dims[1] + gcoord[:, 1]) * self.dims[2] \
+            + gcoord[:, 2]
+
+        _, inverse = torch.unique(key, return_inverse=True)
+        order = torch.arange(tensor.shape[0], device=tensor.device)
+        rep_idx = order.new_full((int(inverse.max()) + 1,), tensor.shape[0])
+        rep_idx.scatter_reduce_(0, inverse, order, reduce='amin',
+                                include_self=True)
+
+        results['points'] = points[rep_idx]
+        return results
+
+    def _check_not_empty(self, results, n_raw, n_in_range):
+        if self.min_points <= 0 or n_in_range >= self.min_points:
+            return
+        raise EmptyLidarTileError(
+            f'tile {results.get("sample_idx")} has {n_in_range} of {n_raw} '
+            f'point(s) inside point_cloud_range={self.point_cloud_range} '
+            f'(need >= {self.min_points}); it would voxelize to zero voxels. '
+            'Regenerate the annotation pkl with '
+            'custom_tools/maptrv2/custom_carla_map_converter.py to drop tiles '
+            'like this up front, or widen the range.')
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(grid_size={self.grid_size}, '
+                f'point_cloud_range={self.point_cloud_range}, '
+                f'min_points={self.min_points})')

@@ -67,7 +67,7 @@ class MapTRv2(MVXTwoStageDetector):
             'prev_angle': 0,
         }
         self.modality = modality
-        if self.modality == 'fusion' and lidar_encoder is not None :
+        if self.modality in ('fusion', 'lidar') and lidar_encoder is not None :
             if lidar_encoder["voxelize"].get("max_num_points", -1) > 0:
                 voxelize_module = Voxelization(**lidar_encoder["voxelize"])
             else:
@@ -83,8 +83,10 @@ class MapTRv2(MVXTwoStageDetector):
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
-        B = img.size(0)
+        # img.size(0) must be read *after* the None check: with modality='lidar'
+        # there is no image tensor at all, and simple_test used to reach here.
         if img is not None:
+            B = img.size(0)
             
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
@@ -314,20 +316,27 @@ class MapTRv2(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         lidar_feat = None
-        if self.modality == 'fusion':
+        if self.modality in ('fusion', 'lidar'):
             lidar_feat = self.extract_lidar_feat(points)
-        
-        len_queue = img.size(1)
-        prev_img = img[:, :-1, ...]
-        img = img[:, -1, ...]
 
-        prev_img_metas = copy.deepcopy(img_metas)
-        # prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
-        # import pdb;pdb.set_trace()
-        prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) if len_queue>1 else None
+        if self.modality == 'lidar':
+            # No camera branch and no temporal BEV queue. img_metas is already a
+            # flat per-sample list here: the CARLA dataset extends Custom3DDataset
+            # and never goes through the nuScenes union2one() queue packing.
+            img_feats = None
+            prev_bev = None
+        else:
+            len_queue = img.size(1)
+            prev_img = img[:, :-1, ...]
+            img = img[:, -1, ...]
 
-        img_metas = [each[len_queue-1] for each in img_metas]
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+            prev_img_metas = copy.deepcopy(img_metas)
+            # prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
+            # import pdb;pdb.set_trace()
+            prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) if len_queue>1 else None
+
+            img_metas = [each[len_queue-1] for each in img_metas]
+            img_feats = self.extract_feat(img=img, img_metas=img_metas)
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
@@ -417,9 +426,9 @@ class MapTRv2(MVXTwoStageDetector):
     def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False, **kwargs):
         """Test function without augmentaiton."""
         lidar_feat = None
-        if self.modality =='fusion':
+        if self.modality in ('fusion', 'lidar'):
             lidar_feat = self.extract_lidar_feat(points)
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_feats = None if self.modality == 'lidar' else self.extract_feat(img=img, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         new_prev_bev, bbox_pts = self.simple_test_pts(

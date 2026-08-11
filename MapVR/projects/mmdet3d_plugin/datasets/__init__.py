@@ -13,6 +13,9 @@ from .builder import custom_build_dataset
 from .nuscenes_map_dataset import CustomNuScenesLocalMapDataset
 from .nuscenes_offlinemap_dataset import CustomNuScenesOfflineLocalMapDataset
 from .nuscenes_pseudolabel_dataset import PseudoMapDataset
+from .carla_offlinemap_dataset import (CustomCarlaLocalMapDataset,
+                                       PMTCarlaMapDataset)
 __all__ = [
-    'CustomNuScenesDataset','CustomNuScenesLocalMapDataset'
+    'CustomNuScenesDataset','CustomNuScenesLocalMapDataset',
+    'CustomCarlaLocalMapDataset', 'PMTCarlaMapDataset'
 ]

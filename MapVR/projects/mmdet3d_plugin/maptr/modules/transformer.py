@@ -52,6 +52,7 @@ class MapTRPerceptionTransformer(BaseModule):
                  ),
                  two_stage_num_proposals=300,
                  fuser=None,
+                 lidar_bev_proj=None,
                  encoder=None,
                  decoder=None,
                  embed_dims=256,
@@ -65,11 +66,23 @@ class MapTRPerceptionTransformer(BaseModule):
                  feat_down_sample_indice=-1,
                  **kwargs):
         super(MapTRPerceptionTransformer, self).__init__(**kwargs)
+        self.modality = modality
         if modality == 'fusion':
             self.fuser = build_fuser(fuser) #TODO
+        elif modality == 'lidar':
+            # SparseEncoder already emits a dense (B, C*D, H, W) BEV-shaped tensor
+            # (mmdet3d/models/middle_encoders/sparse_encoder.py), so all that is
+            # needed is a channel projection to embed_dims. ConvFuser is reused
+            # because its forward() torch.cat()s its input list, which is the
+            # identity for a single-element list.
+            self.lidar_bev_proj = build_fuser(lidar_bev_proj)
         # self.use_attn_bev = encoder['type'] == 'BEVFormerEncoder'
-        self.use_attn_bev = 'BEVFormerEncoder' in encoder['type']
-        self.encoder = build_transformer_layer_sequence(encoder)
+        # encoder is optional: modality='lidar' never runs a camera BEV encoder,
+        # and building a dead LSSTransform/BEVFormerEncoder only to satisfy this
+        # line would add millions of never-trained parameters to the checkpoint,
+        # the optimizer param groups, and DDP's unused-parameter search.
+        self.use_attn_bev = encoder is not None and 'BEVFormerEncoder' in encoder['type']
+        self.encoder = build_transformer_layer_sequence(encoder) if encoder is not None else None
         self.decoder = build_transformer_layer_sequence(decoder)
         self.embed_dims = embed_dims
         self.num_feature_levels = num_feature_levels
@@ -252,6 +265,17 @@ class MapTRPerceptionTransformer(BaseModule):
         """
         obtain bev features.
         """
+        if self.modality == 'lidar':
+            # LiDAR-only: the BEV comes straight from the sparse encoder, so both
+            # the attention (BEVFormer) and LSS camera encoders are bypassed.
+            assert lidar_feat is not None
+            bev_embed = lidar_feat.permute(0, 1, 3, 2).contiguous()  # B C H W
+            bev_embed = nn.functional.interpolate(
+                bev_embed, size=(bev_h, bev_w), mode='bicubic', align_corners=False)
+            bev_embed = self.lidar_bev_proj([bev_embed])
+            bev_embed = bev_embed.flatten(2).permute(0, 2, 1).contiguous()
+            return dict(bev=bev_embed, depth=None)
+
         if self.use_attn_bev:
             ret_dict = self.attn_bev_encode(
                 mlvl_feats,
@@ -374,7 +398,7 @@ class MapTRPerceptionTransformer(BaseModule):
             **kwargs)  # bev_embed shape: bs, bev_h*bev_w, embed_dims
         bev_embed = ouput_dic['bev']
         depth = ouput_dic['depth']
-        bs = mlvl_feats[0].size(0)
+        bs = lidar_feat.shape[0] if self.modality == 'lidar' else mlvl_feats[0].size(0)
         query_pos, query = torch.split(
             object_query_embed, self.embed_dims, dim=1)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
@@ -387,8 +411,13 @@ class MapTRPerceptionTransformer(BaseModule):
         query_pos = query_pos.permute(1, 0, 2)
         bev_embed = bev_embed.permute(1, 0, 2)
 
-        feat_flatten, feat_spatial_shapes, feat_level_start_index \
-            = self.format_feats(mlvl_feats)
+        if self.modality == 'lidar':
+            # format_feats() reshapes per-camera image features; there are none.
+            # The decoder only consumes value=bev_embed with [[bev_h, bev_w]].
+            feat_flatten = feat_spatial_shapes = feat_level_start_index = None
+        else:
+            feat_flatten, feat_spatial_shapes, feat_level_start_index \
+                = self.format_feats(mlvl_feats)
 
         inter_states, inter_references = self.decoder(
             query=query,

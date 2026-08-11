@@ -129,7 +129,11 @@ class MapTRv2Head(DETRHead):
 
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
-        self.bev_encoder_type = transformer.encoder.type
+        # A LiDAR-only transformer has no camera BEV encoder at all. Only used
+        # below to decide whether bev_embedding is needed (it is not: that is
+        # the BEVFormer attention encoder's query embedding).
+        self.bev_encoder_type = (transformer.encoder.type
+                                 if transformer.get('encoder') is not None else '')
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
         if 'code_size' in kwargs:
@@ -302,8 +306,13 @@ class MapTRv2Head(DETRHead):
             # import ipdb;ipdb.set_trace()
 
 
-        bs, num_cam, _, _, _ = mlvl_feats[0].shape
-        dtype = mlvl_feats[0].dtype
+        if mlvl_feats is not None:
+            bs, num_cam, _, _, _ = mlvl_feats[0].shape
+            dtype = mlvl_feats[0].dtype
+        else:
+            # modality='lidar': no image features, the BEV comes from lidar_feat.
+            bs = lidar_feat.shape[0]
+            dtype = lidar_feat.dtype
         # import ipdb;ipdb.set_trace()
         if self.query_embed_type == 'all_pts':
             object_query_embeds = self.query_embedding.weight.to(dtype)
@@ -325,8 +334,9 @@ class MapTRv2Head(DETRHead):
         # make attn mask
         """ attention mask to prevent information leakage
         """
+        device = mlvl_feats[0].device if mlvl_feats is not None else lidar_feat.device
         self_attn_mask = (
-            torch.zeros([num_vec, num_vec,]).bool().to(mlvl_feats[0].device)
+            torch.zeros([num_vec, num_vec,]).bool().to(device)
         )
         self_attn_mask[self.num_vec_one2one :, 0 : self.num_vec_one2one,] = True
         self_attn_mask[0 : self.num_vec_one2one, self.num_vec_one2one :,] = True
@@ -421,8 +431,10 @@ class MapTRv2Head(DETRHead):
             seg_bev_embed = bev_embed.permute(1,0,2).view(bs,self.bev_h, self.bev_w, -1).permute(0,3,1,2).contiguous()
             if self.aux_seg['bev_seg']:
                 outputs_seg = self.seg_head(seg_bev_embed)
-            bs, num_cam, embed_dims, feat_h, feat_w = mlvl_feats[-1].shape
             if self.aux_seg['pv_seg']:
+                # Camera-only: mlvl_feats is None under modality='lidar'. This also
+                # rebinds bs, which must not happen on the LiDAR path.
+                bs, num_cam, embed_dims, feat_h, feat_w = mlvl_feats[-1].shape
                 outputs_pv_seg = self.pv_seg_head(mlvl_feats[-1].flatten(0,1))
                 outputs_pv_seg = outputs_pv_seg.view(bs, num_cam, -1, feat_h, feat_w)
 
@@ -961,7 +973,10 @@ class MapTRv2Head(DETRHead):
                     if self.loss_seg._get_name() == 'SimpleLoss':
                         loss_seg = self.loss_seg(seg_output, seg_gt.float())
                     elif self.loss_seg._get_name() == 'MaskedBCE':
-                        inter_bev_mask = F.interpolate(bev_mask.unsqueeze(1), size=(200, 100), mode='nearest')
+                        # size must follow the config's BEV grid, not a hardcoded
+                        # 200x100 (identical for every nuScenes config, wrong for
+                        # the square BEV a square-tile dataset needs).
+                        inter_bev_mask = F.interpolate(bev_mask.unsqueeze(1), size=(self.bev_h, self.bev_w), mode='nearest')
                         loss_seg = self.loss_seg(seg_output, seg_gt.float(), inter_bev_mask)
                     else:
                         raise NotImplementedError

@@ -487,13 +487,6 @@ class LoadCarlaPointsFromFile(object):
     points land in the same tile-centred frame as the GT polylines -- see
     ``_load_points``.
 
-    Unlike the upstream MapTRv2/GeMap version there is deliberately **no
-    ``z_max`` filter**: nothing is dropped on the z axis here. Tiles in this
-    dataset legitimately span roughly z in [-90, +90] m (highway overpasses
-    inside a 25 x 25 m footprint), and the training config's
-    ``lidar_point_cloud_range`` is set wide enough to cover that, so the
-    voxelizer keeps those returns too.
-
     Args:
         coord_type (str): Coordinate frame of the points. One of
             ``'LIDAR'``, ``'DEPTH'``, ``'CAMERA'``. Defaults to ``'LIDAR'``.
@@ -501,12 +494,20 @@ class LoadCarlaPointsFromFile(object):
             (``x, y, z, strength``). Defaults to 4.
         use_dim (int | list[int]): Which of those columns to keep. Defaults to
             4 (all of them).
+        z_max (float | None): Drop points with ``z`` greater than this value,
+            applied after the recentring shift (so it filters final-frame z,
+            as the GeMap/mapdiffusion loaders do -- the shift's z component
+            is exactly 0 on current exports, so the order is currently
+            inert). Reinstated 2026-08-28 to mirror the sibling repos'
+            loaders for benchmark alignment; ``None`` (the default) disables
+            it, which is this loader's original behaviour.
     """
 
     def __init__(self,
                  coord_type='LIDAR',
                  load_dim=4,
-                 use_dim=4):
+                 use_dim=4,
+                 z_max=None):
         if isinstance(use_dim, int):
             use_dim = list(range(use_dim))
         assert max(use_dim) < load_dim, \
@@ -515,6 +516,7 @@ class LoadCarlaPointsFromFile(object):
         self.coord_type = coord_type
         self.load_dim = load_dim
         self.use_dim = use_dim
+        self.z_max = z_max
         # ITU-R BT.709 luma weights, as in the original Pointcept dataset.
         self._rgb2strength = np.array([0.2126, 0.7152, 0.0722],
                                       dtype=np.float32)
@@ -537,7 +539,10 @@ class LoadCarlaPointsFromFile(object):
             coord = coord + np.asarray(recenter_shift, dtype=np.float32)
         strength = (features[:, 3:6].astype(np.float32)
                     @ self._rgb2strength).reshape([-1, 1])
-        return np.concatenate([coord, strength], axis=1)
+        points = np.concatenate([coord, strength], axis=1)
+        if self.z_max is not None:
+            points = points[points[:, 2] <= self.z_max]
+        return points
 
     def __call__(self, results):
         pts_filename = results['pts_filename']
@@ -554,7 +559,8 @@ class LoadCarlaPointsFromFile(object):
     def __repr__(self):
         return (f'{self.__class__.__name__}('
                 f'coord_type={self.coord_type}, '
-                f'load_dim={self.load_dim}, use_dim={self.use_dim})')
+                f'load_dim={self.load_dim}, use_dim={self.use_dim}, '
+                f'z_max={self.z_max})')
 
 
 @PIPELINES.register_module()

@@ -85,6 +85,14 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         # Where the raw tiles live. data_root holds the pkl / GT json, which
         # the dataset the converter was pointed at with --data-root need not.
         # Defaults to data_root for the common case where they coincide.
+        # Join base for the pkl's relative lidar_path entries. None here
+        # defers to the (absolute) data_root the converter recorded in the
+        # pkl -- resolved in load_annotations, since the pkl is not open yet
+        # -- and failing that to data_root. An explicit value always wins,
+        # for machines where the export lives elsewhere than it did at
+        # conversion time. os.path.join is a no-op on the absolute paths some
+        # sibling-repo pkls store, so any base is harmless for those.
+        self._raw_data_root_arg = raw_data_root
         self.raw_data_root = raw_data_root if raw_data_root is not None else data_root
         self.code_size = code_size
         self.bev_size = bev_size
@@ -128,6 +136,15 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
 
     def load_annotations(self, ann_file):
         data = mmcv.load(ann_file, file_format='pkl')
+        # No explicit raw_data_root in the config: prefer the absolute
+        # data_root the converter recorded in the pkl (what lidar_path is
+        # actually relative to) over the config's data_root guess -- but
+        # only when that path exists here, since a pkl converted on another
+        # machine records that machine's path.
+        pkl_root = data.get('data_root')
+        if self._raw_data_root_arg is None and pkl_root and \
+                os.path.isdir(pkl_root):
+            self.raw_data_root = pkl_root
         samples = sorted(data['samples'], key=lambda e: e['sample_idx'])
         return self._filter_empty_lidar_tiles(samples,
                                               data.get('lidar_check'))

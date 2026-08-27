@@ -41,10 +41,9 @@ holds every class, so a class-carrying export converts all of them unless
 --classes says otherwise.
 
 Each tile's LiDAR block is also scanned for points that would actually
-survive the training pipeline's filters -- which, in this repo, means only
-``--lidar-point-cloud-range``: ``LoadCarlaPointsFromFile`` here does **no**
-z filtering (``--z-max`` defaults to off and exists only to mirror a loader
-that applies one). Tiles with fewer than ``--min-lidar-points``
+survive the training pipeline's filters: the loader's ``z <= --z-max`` cut
+(96 by default, mirroring ``LoadCarlaPointsFromFile``'s reinstated filter)
+and ``--lidar-point-cloud-range``. Tiles with fewer than ``--min-lidar-points``
 such points would voxelize to *zero* voxels and crash ``extract_lidar_feat``,
 so they are dropped from the pkl and listed in a sidecar report. Every kept
 sample records its own count so the dataset can re-check cheaply. The
@@ -66,20 +65,19 @@ import numpy as np
 
 # z half of the range the training config's LiDAR branch uses
 # (`lidar_point_cloud_range` in projects/configs/maptrv2/pmt_carla_lidar.py).
-# Wide on purpose: this pipeline does no z filtering anywhere, so the
-# voxelizer range is the only thing that can drop a point on the z axis, and
-# these tiles legitimately span a lot of z (highway overpasses inside a
-# 25 x 25 m footprint). Measured exactly over all 4103 train + 259 test tiles
-# of the reference export: z in [-97.09, +91.43]. Re-measure for a different
-# export -- see the sweep documented in projects/configs/carla/carlasim_map.py.
+# [-72, 96] since 2026-08-28, matching the MapTRv2/GeMap benchmark configs
+# so all sibling repos voxelize the same point set from a shared pkl (this
+# converter previously used [-98, 92] with no loader z filter -- that span
+# was measured on the 25 m export, whose town03/town05 overpass tiles dip
+# below -72; the 30 m tile-centre export has no point outside [-72, 96]).
 # The xy half is NOT a constant: it follows the tile size read from the
 # manifest (see default_pc_range), because a range narrower than the tile
 # silently crops it and a wider one just wastes BEV cells. The whole range is
 # recorded into the pkl so the dataset can warn if config and pkl drift apart.
-DEFAULT_Z_RANGE = (-98.0, 92.0)
-# No loader-side z filter in this repo (LoadCarlaPointsFromFile drops its
-# z_max argument entirely), so nothing to mirror here by default.
-DEFAULT_Z_MAX = None
+DEFAULT_Z_RANGE = (-72.0, 96.0)
+# Mirrors the loader's z_max=96.0 early filter (reinstated alongside the
+# range change above), so the in-range counts describe what training sees.
+DEFAULT_Z_MAX = 96.0
 # Only used when a manifest carries no tile geometry at all; matches the
 # original 25m export this converter was written against.
 FALLBACK_TILE_RADIUS = 12.5
@@ -145,9 +143,9 @@ def parse_args():
         '--z-max',
         type=float,
         default=DEFAULT_Z_MAX,
-        help='optional early z filter to mirror when counting in-range '
-        'points. This repo does no z filtering, so it defaults to off; set '
-        'it only if you reinstate one in LoadCarlaPointsFromFile')
+        help='early z filter to mirror when counting in-range points; '
+        f'defaults to {DEFAULT_Z_MAX}, matching LoadCarlaPointsFromFile\'s '
+        'own z_max in the training configs')
     parser.add_argument(
         '--min-lidar-points',
         type=int,
@@ -636,7 +634,10 @@ def main():
         dict(
             samples=samples,
             split=args.split,
-            data_root=args.data_root,
+            # Absolute on purpose: every sample's lidar_path is relative to
+            # it, and the dataset uses it as the join-base fallback when the
+            # config sets no raw_data_root.
+            data_root=os.path.abspath(args.data_root),
             # Frame of every annotation in `samples` (also recorded per
             # sample); same key as the MapTRv2 benchmark repo's pkls.
             gt_frame=meta['gt_frame'],

@@ -288,13 +288,14 @@ raw_data_root = None
 # occupied voxels. Its grid matches lidar_voxel_size, so it costs no spatial
 # precision the voxelizer would not have taken anyway.
 train_pipeline = [
-    # load_dim stays 4 (the loader builds the strength column before
-    # selecting); use_dim=3 keeps only xyz -- see in_channels=3 above. The
-    # loader also recentres the points into the tile-centred frame whenever
-    # the pkl records a lidar_recenter_shift (--gt-frame tile_center, the
-    # converter's default), keeping points and GT in the same frame.
+    # xyz only -- see in_channels=3 above. With load_dim=3 the loader skips
+    # building the BT.709 strength column entirely instead of building and
+    # discarding it. The loader also recentres the points into the
+    # tile-centred frame whenever the pkl records a lidar_recenter_shift
+    # (--gt-frame tile_center, the converter's default), keeping points and
+    # GT in the same frame.
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
-         load_dim=4, use_dim=3, z_max=96.0),
+         load_dim=3, use_dim=3, z_max=96.0),
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(type='DefaultFormatBundle3D', with_gt=False, with_label=False,
@@ -308,7 +309,7 @@ train_pipeline = [
 test_pipeline = [
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
          # colour-free and z-filtered, matching train_pipeline
-         load_dim=4, use_dim=3, z_max=96.0),
+         load_dim=3, use_dim=3, z_max=96.0),
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(

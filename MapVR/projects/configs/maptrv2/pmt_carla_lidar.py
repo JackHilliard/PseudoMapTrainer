@@ -133,7 +133,14 @@ model = dict(
             max_voxels=[90000, 120000]),
         backbone=dict(
             type='SparseEncoder',
-            in_channels=4,          # x, y, z, strength (BT.709 luma of rgb)
+            # x, y, z only. The points also carry a "strength" channel
+            # (BT.709 luma of the per-point rgb), dropped via use_dim=3 in
+            # the pipelines below to match the MapTRv2 30m HM benchmark
+            # convention (colour-free). This value and use_dim MUST move
+            # together -- a mismatch fails at the first sparse conv.
+            # sparse_shape and lidar_bev_proj.in_channels do not depend on
+            # the input channel width.
+            in_channels=3,
             sparse_shape=[301, 301, 476],
             output_channels=128,
             order=('conv', 'norm', 'act'),
@@ -277,8 +284,13 @@ raw_data_root = 'data/carla/'
 # occupied voxels. Its grid matches lidar_voxel_size, so it costs no spatial
 # precision the voxelizer would not have taken anyway.
 train_pipeline = [
+    # load_dim stays 4 (the loader builds the strength column before
+    # selecting); use_dim=3 keeps only xyz -- see in_channels=3 above. The
+    # loader also recentres the points into the tile-centred frame whenever
+    # the pkl records a lidar_recenter_shift (--gt-frame tile_center, the
+    # converter's default), keeping points and GT in the same frame.
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
-         load_dim=4, use_dim=4),
+         load_dim=4, use_dim=3),
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(type='DefaultFormatBundle3D', with_gt=False, with_label=False,
@@ -291,7 +303,7 @@ train_pipeline = [
 # test-time nesting.
 test_pipeline = [
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
-         load_dim=4, use_dim=4),
+         load_dim=4, use_dim=3),  # colour-free, matching train_pipeline
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(

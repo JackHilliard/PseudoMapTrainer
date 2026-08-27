@@ -207,6 +207,17 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
 
     def get_data_info(self, index):
         info = self.data_infos[index]
+        # A pkl converted with --gt-frame tile_center expresses its GT
+        # relative to the tile centre and must record the shift that puts
+        # the (offset-frame) stored points into that same frame. Refuse to
+        # load one that declares the frame but lacks the shift, rather than
+        # training against points displaced by up to ~17 m from their GT.
+        if info.get('gt_frame') == 'tile_center' and \
+                info.get('lidar_recenter_shift') is None:
+            raise ValueError(
+                f"{info['sample_idx']}: gt_frame is 'tile_center' but the "
+                "sample records no lidar_recenter_shift -- regenerate the "
+                "pkl with custom_tools/maptrv2/custom_carla_map_converter.py")
         # lidar_path is stored relative to raw_data_root (see the converter's
         # --data-root) so the pkl stays valid across containers and mounts
         # instead of baking in an absolute path from wherever conversion ran.
@@ -224,6 +235,12 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
             can_bus=np.zeros(18, dtype=np.float32),
             annotation=info['annotation'],
             ann_info=info['annotation'],
+            # Frame bookkeeping, read by LoadCarlaPointsFromFile (the shift)
+            # and by host-side tooling (origin/frame). All None/absent on
+            # offset-frame pkls, which load exactly as before.
+            annotation_origin=info.get('annotation_origin'),
+            gt_frame=info.get('gt_frame'),
+            lidar_recenter_shift=info.get('lidar_recenter_shift'),
         )
 
     @staticmethod

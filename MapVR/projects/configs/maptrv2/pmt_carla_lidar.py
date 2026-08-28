@@ -58,18 +58,16 @@ voxel_size = [0.15, 0.15, 20.0]
 
 # LiDAR branch geometry, deliberately separate from the map range above.
 #
-# The z half is wide because this pipeline does NO z filtering anywhere:
-# LoadCarlaPointsFromFile drops the upstream z_max clamp, so this range is
-# the only thing that could discard a point on the z axis. Measured exactly
-# over all 4103 train + 259 test tiles of the 25 m reference export, z spans
-# [-97.09, +91.43] -- a tile is only tens of metres across but can contain a
-# highway overpass, so it spans 100+ m vertically. [-98, 92] contains all of
-# it. For reference, the upstream CARLA configs' [-72, 96] would clip 2.4% of
-# those tiles. This z half is carried over unmeasured to the 30 m export:
-# re-measure it (min/max of features[:, 2] over every tile) before a real run,
-# since with no z filtering anywhere this range is the only thing that can
-# drop a point on the z axis.
-lidar_point_cloud_range = [-15.0, -15.0, -98.0, 15.0, 15.0, 92.0]
+# z is [-72, 96] with a z_max=96 early filter on the loaders, matching the
+# MapTRv2/GeMap 30m benchmark configs exactly, so all repos voxelize the
+# same point set from a shared pkl. This replaces this config's original
+# [-98, 92] with no z filtering; that wider span was measured on the 25 m
+# export, where 98 town03/town05 overpass tiles dip below -72 (2.4% of
+# tiles) -- on the 30 m tile-centre export the upstream repos observe no
+# point outside [-72, 96] at all, so nothing is clipped here. If a future
+# export breaches it, widen z in ALL sibling repos together (and re-measure
+# sparse_shape / lidar_bev_proj.in_channels) rather than diverging again.
+lidar_point_cloud_range = [-15.0, -15.0, -72.0, 15.0, 15.0, 96.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 
 map_classes = ['divider']
@@ -122,9 +120,11 @@ model = dict(
     modality='lidar',
     # LiDAR BEV encoder. SparseEncoder returns a dense (B, C*D, H, W) tensor,
     # so no pooling/LSS step is needed -- the transformer only channel-projects
-    # it. sparse_shape is (x, y, z+1) for the range/voxel size above: 301 =
-    # 30 m / 0.1 + 1. Measured, not derived (verified: the largest voxel index
-    # a real tile produces is 299/299/474, inside these bounds).
+    # it. sparse_shape is (x, y, z+1) for the range/voxel size above:
+    # 301 = 30 m / 0.1 + 1, 421 = 168 m / 0.4 + 1 -- the same values the
+    # sibling GeMap/MapTRv2 30m configs pair with this identical range,
+    # voxel size and encoder (same vendored fork, same [x, y, z] axis
+    # order).
     lidar_encoder=dict(
         voxelize=dict(
             max_num_points=10,
@@ -133,8 +133,15 @@ model = dict(
             max_voxels=[90000, 120000]),
         backbone=dict(
             type='SparseEncoder',
-            in_channels=4,          # x, y, z, strength (BT.709 luma of rgb)
-            sparse_shape=[301, 301, 476],
+            # x, y, z only. The points also carry a "strength" channel
+            # (BT.709 luma of the per-point rgb), dropped via use_dim=3 in
+            # the pipelines below to match the MapTRv2 30m HM benchmark
+            # convention (colour-free). This value and use_dim MUST move
+            # together -- a mismatch fails at the first sparse conv.
+            # sparse_shape and lidar_bev_proj.in_channels do not depend on
+            # the input channel width.
+            in_channels=3,
+            sparse_shape=[301, 301, 421],
             output_channels=128,
             order=('conv', 'norm', 'act'),
             encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
@@ -172,18 +179,19 @@ model = dict(
             use_can_bus=True,
             embed_dims=_dim_,
             modality='lidar',
-            # 3712 = SparseEncoder output_channels (128) x its residual z
-            # depth (29), measured with a real extract_lidar_feat() call:
-            # lidar_feat comes out (B, 3712, 38, 38) at this tile size. Only
-            # the z half of lidar_point_cloud_range moves this number -- tile
-            # size changes the spatial dims (32x32 at 25 m, 38x38 at 30 m) but
-            # not the channel count. Do not derive it by hand: the z
-            # downsample factor is not linear in the input extent (naively it
-            # looks like 3584). MEASURE it again if the LiDAR z range or voxel
-            # size changes; a wrong value fails loudly as a Conv2d mismatch.
+            # 3200 = SparseEncoder output_channels (128) x its residual z
+            # depth (25). Only the z half of lidar_point_cloud_range moves
+            # this number -- tile size changes the spatial dims but not the
+            # channel count. This value was MEASURED (not derived -- the z
+            # downsample factor is not linear in the input extent) in the
+            # sibling GeMap/MapTRv2 repos for exactly this z geometry
+            # (z [-72, 96], voxel 0.4) and encoder; it was 3712 when this
+            # config's z span was the wider [-98, 92]. Re-measure with a
+            # dummy extract_lidar_feat() call if the z range or voxel size
+            # ever changes; a wrong value fails loudly as a Conv2d mismatch.
             lidar_bev_proj=dict(
                 type='ConvFuser',
-                in_channels=[3712],
+                in_channels=[3200],
                 out_channels=_dim_),
             # No `encoder`: the LiDAR path never runs a camera BEV encoder,
             # and MapTRPerceptionTransformer now treats it as optional rather
@@ -269,7 +277,10 @@ model = dict(
 
 dataset_type = 'PMTCarlaMapDataset'
 data_root = 'data/carla/'
-raw_data_root = 'data/carla/'
+# None = resolve the LiDAR paths against the absolute data_root recorded in
+# the annotation pkl (what lidar_path is relative to). Set explicitly only
+# when the tile export lives at a different path than at conversion time.
+raw_data_root = None
 
 # GridSamplePoints is not optional here: 18 train tiles hit the converter's
 # 5,000,000-point ceiling (median is ~115k), and at that scale mmdet3d's
@@ -277,8 +288,14 @@ raw_data_root = 'data/carla/'
 # occupied voxels. Its grid matches lidar_voxel_size, so it costs no spatial
 # precision the voxelizer would not have taken anyway.
 train_pipeline = [
+    # xyz only -- see in_channels=3 above. With load_dim=3 the loader skips
+    # building the BT.709 strength column entirely instead of building and
+    # discarding it. The loader also recentres the points into the
+    # tile-centred frame whenever the pkl records a lidar_recenter_shift
+    # (--gt-frame tile_center, the converter's default), keeping points and
+    # GT in the same frame.
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
-         load_dim=4, use_dim=4),
+         load_dim=3, use_dim=3, z_max=96.0),
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(type='DefaultFormatBundle3D', with_gt=False, with_label=False,
@@ -291,7 +308,8 @@ train_pipeline = [
 # test-time nesting.
 test_pipeline = [
     dict(type='LoadCarlaPointsFromFile', coord_type='LIDAR',
-         load_dim=4, use_dim=4),
+         # colour-free and z-filtered, matching train_pipeline
+         load_dim=3, use_dim=3, z_max=96.0),
     dict(type='GridSamplePoints', grid_size=lidar_voxel_size,
          point_cloud_range=lidar_point_cloud_range),
     dict(

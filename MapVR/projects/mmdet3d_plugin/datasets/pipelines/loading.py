@@ -481,12 +481,11 @@ class LoadCarlaPointsFromFile(object):
     channels (ITU-R BT.709 luma), matching the original
     ``strength = rgb @ [0.2126, 0.7152, 0.0722]`` formula.
 
-    Unlike the upstream MapTRv2/GeMap version there is deliberately **no
-    ``z_max`` filter**: nothing is dropped on the z axis here. Tiles in this
-    dataset legitimately span roughly z in [-90, +90] m (highway overpasses
-    inside a 25 x 25 m footprint), and the training config's
-    ``lidar_point_cloud_range`` is set wide enough to cover that, so the
-    voxelizer keeps those returns too.
+    When the pipeline dict carries a ``lidar_recenter_shift`` (threaded from
+    the pkl by ``PMTCarlaMapDataset.get_data_info`` for pkls converted with
+    ``--gt-frame tile_center``), it is added to the stored coordinates so the
+    points land in the same tile-centred frame as the GT polylines -- see
+    ``_load_points``.
 
     Args:
         coord_type (str): Coordinate frame of the points. One of
@@ -495,12 +494,20 @@ class LoadCarlaPointsFromFile(object):
             (``x, y, z, strength``). Defaults to 4.
         use_dim (int | list[int]): Which of those columns to keep. Defaults to
             4 (all of them).
+        z_max (float | None): Drop points with ``z`` greater than this value,
+            applied after the recentring shift (so it filters final-frame z,
+            as the GeMap/mapdiffusion loaders do -- the shift's z component
+            is exactly 0 on current exports, so the order is currently
+            inert). Reinstated 2026-08-28 to mirror the sibling repos'
+            loaders for benchmark alignment; ``None`` (the default) disables
+            it, which is this loader's original behaviour.
     """
 
     def __init__(self,
                  coord_type='LIDAR',
                  load_dim=4,
-                 use_dim=4):
+                 use_dim=4,
+                 z_max=None):
         if isinstance(use_dim, int):
             use_dim = list(range(use_dim))
         assert max(use_dim) < load_dim, \
@@ -509,22 +516,47 @@ class LoadCarlaPointsFromFile(object):
         self.coord_type = coord_type
         self.load_dim = load_dim
         self.use_dim = use_dim
+        # Whether any selected column needs the strength channel. When not
+        # (use_dim=3, the colour-free benchmark convention), the BT.709
+        # matmul over the full cloud -- up to 5M points/tile -- is skipped
+        # entirely rather than computed and then discarded by the use_dim
+        # selection, and every downstream copy is a column narrower.
+        self._need_strength = max(self.use_dim) >= 3
+        self.z_max = z_max
         # ITU-R BT.709 luma weights, as in the original Pointcept dataset.
         self._rgb2strength = np.array([0.2126, 0.7152, 0.0722],
                                       dtype=np.float32)
 
-    def _load_points(self, pts_filename):
+    def _load_points(self, pts_filename, recenter_shift=None):
         mmcv.check_file_exist(pts_filename)
         block = np.load(pts_filename)
         features = block['features']
         coord = features[:, 0:3].astype(np.float32)
-        strength = (features[:, 3:6].astype(np.float32)
-                    @ self._rgb2strength).reshape([-1, 1])
-        return np.concatenate([coord, strength], axis=1)
+        if recenter_shift is not None:
+            # The stored points are always in the block's `offset` frame;
+            # a pkl converted with --gt-frame tile_center expresses its GT
+            # polylines relative to the tile centre instead and records
+            # `lidar_recenter_shift = offset - tile_center` per sample, which
+            # added here lands the points in that same frame
+            # (stored + shift == world - tile_center). Data-driven on
+            # purpose: the frame is a property of the pkl, so an offset-frame
+            # pkl (no shift recorded) loads unshifted and a tile-centre one
+            # recentres -- neither can silently misalign GT against points.
+            coord = coord + np.asarray(recenter_shift, dtype=np.float32)
+        if self._need_strength:
+            strength = (features[:, 3:6].astype(np.float32)
+                        @ self._rgb2strength).reshape([-1, 1])
+            points = np.concatenate([coord, strength], axis=1)
+        else:
+            points = coord
+        if self.z_max is not None:
+            points = points[points[:, 2] <= self.z_max]
+        return points
 
     def __call__(self, results):
         pts_filename = results['pts_filename']
-        points = self._load_points(pts_filename)
+        points = self._load_points(pts_filename,
+                                   results.get('lidar_recenter_shift'))
         points = points[:, self.use_dim]
 
         points_class = get_points_type(self.coord_type)
@@ -536,7 +568,8 @@ class LoadCarlaPointsFromFile(object):
     def __repr__(self):
         return (f'{self.__class__.__name__}('
                 f'coord_type={self.coord_type}, '
-                f'load_dim={self.load_dim}, use_dim={self.use_dim})')
+                f'load_dim={self.load_dim}, use_dim={self.use_dim}, '
+                f'z_max={self.z_max})')
 
 
 @PIPELINES.register_module()

@@ -42,6 +42,30 @@ from .nuscenes_offlinemap_dataset import (LiDARInstanceLines,
 from .pipelines.loading import EmptyLidarTileError
 
 
+class VectorizedCarlaLocalMap(VectorizedLocalMap):
+    """``VectorizedLocalMap`` with a label mapping built from the config.
+
+    The nuScenes base hardcodes ``CLASS2LABEL`` to nuScenes class names
+    ('divider', 'ped_crossing', 'boundary', 'centerline'), and
+    ``gen_vectorized_samples`` drops any annotation key that maps to -1. A
+    CARLA taxonomy of its own -- 'driving'/'curb', say -- would therefore
+    vectorize to *zero* instances with no error, which is the failure mode
+    this class exists to remove (the same fix the sibling MapTRv2 repo
+    carries): labels are simply the position of each name in
+    ``map_classes``.
+
+    For the historical single-class ``['divider']`` config that is
+    ``{'divider': 0}``, i.e. bit-identical to the base's behaviour.
+    """
+
+    def __init__(self, *args, map_classes=('divider', ), **kwargs):
+        super().__init__(*args, map_classes=map_classes, **kwargs)
+        self.CLASS2LABEL = {
+            name: label
+            for label, name in enumerate(self.vec_classes)
+        }
+
+
 @DATASETS.register_module()
 class CustomCarlaLocalMapDataset(Custom3DDataset):
     """CARLA simulator dataset with vectorized map (divider) ground truth."""
@@ -117,7 +141,7 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         # This repo's VectorizedLocalMap has no code_size/min_z/max_z args (it
         # is always 2D, matching pred_z_flag=False in every config here);
         # self.code_size is still used to slice GT points in _format_gt().
-        self.vector_map = VectorizedLocalMap(
+        self.vector_map = VectorizedCarlaLocalMap(
             canvas_size=bev_size,
             patch_size=self.patch_size,
             map_classes=self.MAPCLASSES,

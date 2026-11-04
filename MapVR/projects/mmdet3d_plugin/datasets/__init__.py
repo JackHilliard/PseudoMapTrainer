@@ -16,8 +16,10 @@ from .nuscenes_pseudolabel_dataset import PseudoMapDataset
 from .carla_offlinemap_dataset import (CustomCarlaLocalMapDataset,
                                        PMTCarlaMapDataset)
 from .carla50m_crop_dataset import PMTCarla50mCropDataset, LoadCarla50mCrop
+from .sanjose50m_crop_dataset import PMTSanJose50mCropDataset
 __all__ = [
     'CustomNuScenesDataset','CustomNuScenesLocalMapDataset',
     'CustomCarlaLocalMapDataset', 'PMTCarlaMapDataset',
-    'PMTCarla50mCropDataset', 'LoadCarla50mCrop'
+    'PMTCarla50mCropDataset', 'LoadCarla50mCrop',
+    'PMTSanJose50mCropDataset'
 ]

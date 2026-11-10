@@ -67,6 +67,12 @@ class PMTSanJose50mCropDataset(PMTCarla50mCropDataset):
             same length (positional pairing, as in the parent).
         check_finalize (bool): compare the manifest's ``finalize`` block with
             the crop kwargs and warn on mismatch (default True).
+        min_crop_points (int | 'manifest'): train-time floor on the RAW
+            points a freshly drawn crop must hold, else it is skipped and
+            another tile drawn (real LiDAR has coverage gaps). ``'manifest'``
+            (default) reads the export's ``filters.min_points`` (20000) from
+            the split json; 0 disables. Never applied to frozen val/test
+            crops, whose minimum the split finaliser already guarantees.
     """
 
     def __init__(self,
@@ -75,6 +81,7 @@ class PMTSanJose50mCropDataset(PMTCarla50mCropDataset):
                  split=None,
                  gt_classes=None,
                  check_finalize=True,
+                 min_crop_points='manifest',
                  **kwargs):
         if split:
             raise ValueError(
@@ -85,6 +92,7 @@ class PMTSanJose50mCropDataset(PMTCarla50mCropDataset):
         self.finalize = {}
         super().__init__(data_root=data_root, ann_file=ann_file, split='',
                          gt_classes=gt_classes or SANJOSE_GT_CLASSES,
+                         min_crop_points=min_crop_points,
                          **kwargs)
 
     # ------------------------------------------------------------------

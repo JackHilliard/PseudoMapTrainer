@@ -56,6 +56,7 @@ from mmdet.datasets.builder import PIPELINES
 from mmdet3d.core.points import get_points_type
 
 from .carla50m_metrics import precision_and_chamfer
+from .pipelines.loading import EmptyLidarTileError
 from .carla_offlinemap_dataset import PMTCarlaMapDataset
 
 
@@ -176,6 +177,7 @@ class PMTCarla50mCropDataset(PMTCarlaMapDataset):
                  z_ground_percentile=2.0,
                  crop_seed=None,
                  map_classes=None,
+                 min_crop_points=0,
                  raster=None,
                  **kwargs):
         # --- all of these are read by load_annotations(), which the base
@@ -193,6 +195,7 @@ class PMTCarla50mCropDataset(PMTCarlaMapDataset):
         self.min_polyline_len = float(min_polyline_len)
         self.z_ground_percentile = float(z_ground_percentile)
         self.crop_seed = crop_seed
+        self.min_crop_points = min_crop_points   # resolved in load_annotations
         # Export class name -> output label. Labels follow map_classes order
         # (VectorizedCarlaLocalMap builds CLASS2LABEL from that same list), so
         # gt_classes[i] is what the export calls map_classes[i].
@@ -214,9 +217,32 @@ class PMTCarla50mCropDataset(PMTCarlaMapDataset):
                          map_classes=map_classes, **kwargs)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_min_points(value, man, ann_file, name='min_crop_points'):
+        """``value`` as an int; ``'manifest'`` reads ``filters.min_points``.
+
+        The export was tiled with ``filters.min_points`` raw points per 50 m
+        tile (20000 for ``san_jose_tiles_50m``); the dataloader's floor on a
+        freshly drawn train crop is that same number, read from the manifest
+        instead of being copied into every config. ``0`` disables the check.
+        """
+        if isinstance(value, str):
+            if value != 'manifest':
+                raise ValueError(
+                    f"{name} must be an int or 'manifest', got {value!r}")
+            value = (man.get('filters') or {}).get('min_points')
+            if value is None:
+                raise ValueError(
+                    f'{ann_file}: {name}="manifest" but the manifest has no '
+                    f'filters.min_points entry')
+        return int(value)
+
+    # ------------------------------------------------------------------
     def load_annotations(self, ann_file):
         with open(ann_file) as f:
             man = json.load(f)
+        self.min_crop_points = self._resolve_min_points(
+            self.min_crop_points, man, ann_file)
         tiles = man.get('tiles', [])
         names = [t['name'] if isinstance(t, dict) else t for t in tiles]
         if not names:
@@ -485,6 +511,9 @@ class PMTCarla50mCropDataset(PMTCarlaMapDataset):
             crop_noise_std=self.noise_std,
             crop_noise_xy_only=self.noise_xy_only,
             crop_z_pct=self.z_ground_percentile,
+            # train-only raw-point floor, enforced by LoadCarla50mCrop;
+            # frozen (val/test) crops are never skipped
+            crop_min_points=0 if 'annotation' in info else self.min_crop_points,
         )
 
 
@@ -536,6 +565,13 @@ class LoadCarla50mCrop(object):
         keep = (np.abs(local[:, 0]) <= half) & (np.abs(local[:, 1]) <= half)
 
         n = int(keep.sum())
+        need = int(results.get('crop_min_points', 0) or 0)
+        if n < need:
+            # Train-only floor set by the dataset (San Jose: the manifest's
+            # filters.min_points); the dataset catches this and resamples.
+            raise EmptyLidarTileError(
+                f'tile {results.get("sample_idx")}: {n} raw point(s) in the '
+                f'{2 * half:g} m crop (need >= {need})')
         xyz = np.empty((n, 3), dtype=np.float32)
         xyz[:, :2] = local[keep].astype(np.float32)
         xyz[:, 2] = world[keep, 2].astype(np.float32)

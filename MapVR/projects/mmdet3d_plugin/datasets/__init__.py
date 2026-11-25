@@ -18,9 +18,11 @@ from .carla_offlinemap_dataset import (CustomCarlaLocalMapDataset,
 from .carla50m_crop_dataset import PMTCarla50mCropDataset, LoadCarla50mCrop
 from .sanjose50m_crop_dataset import PMTSanJose50mCropDataset
 from .hrdx50m_dataset import PMTHrdx50mDataset, LoadHrdx50mTile
+from .carla3cls50m_dataset import PMTCarla3cls50mDataset, LoadCarla3cls50mTile
 __all__ = [
     'CustomNuScenesDataset','CustomNuScenesLocalMapDataset',
     'CustomCarlaLocalMapDataset', 'PMTCarlaMapDataset',
     'PMTCarla50mCropDataset', 'LoadCarla50mCrop',
-    'PMTSanJose50mCropDataset', 'PMTHrdx50mDataset', 'LoadHrdx50mTile'
+    'PMTSanJose50mCropDataset', 'PMTHrdx50mDataset', 'LoadHrdx50mTile',
+    'PMTCarla3cls50mDataset', 'LoadCarla3cls50mTile'
 ]

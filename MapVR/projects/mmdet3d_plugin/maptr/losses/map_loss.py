@@ -863,7 +863,10 @@ def mask_sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gam
 
 @MATCH_COST.register_module()
 class RenderedMaskDiceCost(object):
-    def __init__(self, weight=10.):
+    """``polygon_class_labels``: labels rendered as filled polygons (the rest as lines). The
+    default (1,) is nuScenes' ped_crossing; datasets whose label 1 is a line class (e.g. the
+    CARLA 3-class benchmark, label 1 = curb_model) must pass () or their own polygon labels."""
+    def __init__(self, weight=10., polygon_class_labels=(1,)):
         self.weight = weight
 
         # TODO: to make rasterization's hyperparameters configurable and not hardcoded
@@ -871,7 +874,7 @@ class RenderedMaskDiceCost(object):
         self.renderer_polygon = SoftPolygon(4.0, 'mask')
         self.renderer_H = 128
         self.renderer_W = 64
-        self.polygon_class_labels = [1]
+        self.polygon_class_labels = list(polygon_class_labels)
         self.lane_class_labels = [0, 2]
 
     @torch.no_grad()
@@ -916,7 +919,10 @@ class RenderedMaskDiceCost(object):
 
 @LOSSES.register_module()
 class RenderedMaskDiceLoss(object):
-    def __init__(self, weight=10., renderer_H=256, renderer_W=128, sample_weighting_with_mask=True):
+    """``polygon_class_labels``: as ``RenderedMaskDiceCost`` (default (1,) = nuScenes'
+    ped_crossing; pass () when every class is a line)."""
+    def __init__(self, weight=10., renderer_H=256, renderer_W=128, sample_weighting_with_mask=True,
+                 polygon_class_labels=(1,)):
         self.weight = weight
 
         # TODO: to make rasterization's hyperparameters configurable and not hardcoded
@@ -924,7 +930,7 @@ class RenderedMaskDiceLoss(object):
         self.renderer_polygon = SoftPolygon(4.0, 'mask')
         self.renderer_H = renderer_H
         self.renderer_W = renderer_W
-        self.polygon_class_labels = [1]
+        self.polygon_class_labels = list(polygon_class_labels)
         self.lane_class_labels = [0, 2]
         self.sample_weighting_with_mask = sample_weighting_with_mask
 
@@ -961,7 +967,7 @@ class RenderedMaskDiceLoss(object):
             gt_rendered_as_polygons = self.renderer_polygon(gt_pts, self.renderer_W, self.renderer_H)
 
             # based on gt_labels, select rasterized ground truth points
-            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, device=gt_labels.device))
+            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, dtype=gt_labels.dtype, device=gt_labels.device))
             rendered_gt = torch.where(is_polygon[:,None,None], gt_rendered_as_polygons, gt_rendered_as_lanes)
 
         # select rendering predictions to produce loss based on matching results
@@ -1011,7 +1017,7 @@ class O2MRenderedMaskDiceLoss(RenderedMaskDiceLoss):
             gt_rendered_as_polygons = self.renderer_polygon(gt_pts, self.renderer_W, self.renderer_H)
 
             # based on gt_labels, select rasterized ground truth points
-            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, device=gt_labels.device))
+            is_polygon = torch.isin(gt_labels, torch.tensor(self.polygon_class_labels, dtype=gt_labels.dtype, device=gt_labels.device))
             rendered_gt = torch.where(is_polygon[:,None,None], gt_rendered_as_polygons, gt_rendered_as_lanes)
 
         pred_rendered_masks = torch.where(is_polygon[:,None,None], pred_rendered_as_polygons, pred_rendered_as_lanes)

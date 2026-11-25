@@ -113,3 +113,33 @@ file with PMT's parent class and the three extra `get_data_info` keys) and
 encoder, `RenderedMaskDiceLoss` on a 128 x 128 raster, `MaskedBCE`, `MaskedMapTRAssigner`),
 `mask_mode='ones'`, lr 3e-4, `post_center_range` +-30. Train with `custom_tools/train.py`
 (this repo has no `tools/`). Submit script `run_pmt_hrdx.sh`.
+
+## CARLA 3-class whole-50 m-tile benchmark, "carla3cls" (2026-11-25)
+
+The HRDX benchmark above with CARLA data, defined by the MapTRv2 repo's
+`maptrv2_carla3cls_16ep_lidar_50m_tile.py` and identical in every sister repo:
+data `data/carla_3cls_50m/` (the point2vector_data `outputs/` tree; each manifest tile names
+its `tiles_dir`), splits `data/carla_splits_v1/{train,val,test,test_towns}.json` (18,522 /
+2,236 / 2,309 / 688; `test_towns` = Town01-05 held out, a second test set), smoke
+`smoke/{train200,val30,test30}.json`. Sample key `<town>_<name>`. Three classes
+`['centerline', 'curb_model', 'road_edge']`; GT = `carla_chain_gt.chain_pieces` (pieces of one
+class along one road joined across the 0.1 m straight/arc cut), then HRDX's treatment.
+Input `(x, y, z, strength)` with strength = 0 (no intensity), so the model is the HRDX one.
+GT caches `*_gt_3cls.json` in the splits dir.
+
+Here (under `MapVR/`): `datasets/carla_chain_gt.py` (verbatim, same md5 as MapTR's),
+`datasets/carla3cls50m_dataset.py` (`PMTCarla3cls50mDataset` subclassing
+`PMTHrdx50mDataset`, + `LoadCarla3cls50mTile`; MapTR's file with PMT class names), config
+`projects/configs/maptrv2/pmt_carla3cls_16ep_lidar_50m_tile.py` (+ `_smoke`) = the HRDX
+config with only the data part and the class count changed, plus ONE model change the
+classes force: `RenderedMaskDiceLoss` / `RenderedMaskDiceCost` render the labels in
+`polygon_class_labels` as filled polygons, hardcoded to `[1]` (nuScenes ped_crossing) until
+now -- that would fill CARLA label 1 (`curb_model`, a line). It is now a constructor argument
+(default `(1,)`, unchanged behaviour) and the carla3cls config passes `[]` to both.
+NOTE: the older `pmt_sanjose`/CARLA-crop configs with `['driving', 'curb']` have the same
+problem (label 1 = curb rendered as a polygon) and were left as they are.
+
+Verified 2026-11-25: `hrdx_dump_mmdet.py` on fixture splits (6 train / 5 val tiles) vs the
+MapTRv2 dump: IDENTICAL, labels 0/1/2 present; the HRDX dump against the fake-HRDX reference
+still IDENTICAL; 2-epoch fixture train + eval: finite losses, per-class AP for all three.
+`MapVR/data` is root-owned here, so local checks use absolute data paths in the fixture config.
